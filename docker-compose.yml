@@ -1,0 +1,15 @@
+networks:
+  sandbox_net:
+    name: sandbox_net
+    internal: true # no default route out; only egress-proxy bridges to the internet
+  proxy_uplink:
+    name: proxy_uplink
+
+services:
+  egress-proxy:
+    build: ./agent/sandbox/egress_proxy
+    container_name: egress-proxy
+    networks:
+      - sandbox_net
+      - proxy_uplink
+    restart: unless-stopped
