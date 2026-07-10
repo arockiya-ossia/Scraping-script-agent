@@ -1,7 +1,8 @@
 FROM python:3.11-slim
 
-# Only what a generated scraper is allowed to use — no LLM client libraries,
-# which structurally guarantees "no LLM calls at runtime" (CLAUDE.md §8).
+# Generated scrapers for JS-rendered (SPA) sources need a real browser at
+# runtime; API/SSR scrapers ignore it. Still NO LLM client libraries inside
+# — the "no LLM calls at runtime" guarantee (CLAUDE.md §8) holds structurally.
 RUN pip install --no-cache-dir \
     requests \
     httpx \
@@ -11,7 +12,15 @@ RUN pip install --no-cache-dir \
     python-dateutil \
     pydantic \
     pycountry \
-    pypdf
+    pypdf \
+    playwright
+
+# Install Chromium to a FIXED, world-readable path (not $HOME/.cache) so the
+# browser is found at runtime regardless of what HOME the sandbox sets for
+# writable scratch dirs. Version-agnostic: pulls whatever browser build
+# matches the playwright version pinned above.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium && chmod -R a+rX /ms-playwright
 
 WORKDIR /app
 COPY entrypoint.sh /entrypoint.sh

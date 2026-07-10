@@ -1,8 +1,95 @@
 import json
 
+from agent.models.evidence import InvestigationEvidence, PaginationStatus, SourceType
 from agent.models.network import parse_captured_request
 from agent.nodes import investigate as inv
+from agent.tools.fetch_url import FetchResult
 from agent.tools.probe_endpoint import ProbeResult
+
+
+# --- SPA_RENDERED false-negative regression (job links only after JS) -------
+
+_RENDERED_JOB_LINKS_HTML = (
+    '<ul class="opening-jobs">'
+    '<li><a href="https://acme.zohorecruit.in/jobs/Careers/65449000002129032/Senior-Project-Manager">'
+    "Senior Project Manager</a></li>"
+    '<li><a href="https://acme.zohorecruit.in/jobs/Careers/65449000000416161/Product-Management-Intern">'
+    "Product Management Intern</a></li>"
+    "</ul>"
+)
+
+
+def _classify_with_plain_http(plain_html, rendered_html=_RENDERED_JOB_LINKS_HTML, interactions=None, monkeypatch=None):
+    """Runs _classify_candidates against a rendered fetch_result while the
+    plain-HTTP probe returns `plain_html`. Returns (evidence, sample_text).
+    """
+    def fake_probe(url, method="GET", params=None, json_body=None, headers=None, timeout=20.0):
+        return ProbeResult(url=url, status=200, json_body=None, text_body=plain_html, content_type="text/html")
+
+    monkeypatch.setattr(inv, "probe_endpoint", fake_probe)
+    evidence = InvestigationEvidence(careers_url="https://acme.com/careers")
+    fetch_result = FetchResult(
+        url="https://acme.com/careers",
+        status=200,
+        html=rendered_html,
+        network_requests=[],
+        interactions=interactions or [],
+    )
+    findings = {"careers_url": "https://acme.com/careers"}
+    sample_text = inv._classify_candidates(fetch_result, "https://acme.com/careers", "acme.com", "test", findings, evidence)
+    return evidence, sample_text
+
+
+def test_spa_rendered_links_only_after_js_are_not_discarded(monkeypatch):
+    # Rendered DOM has 2 job links; plain HTTP has NONE. Must classify as
+    # SPA_RENDERED (a valid browser-scrapable source), not reject as a dead
+    # end — this is the exact F22-Labs false-negative.
+    evidence, sample_text = _classify_with_plain_http("<html>no jobs here</html>", monkeypatch=monkeypatch)
+    assert evidence.source_type == SourceType.SPA_RENDERED
+    assert evidence.requires_browser is True
+    assert sample_text is not None
+    assert "BROWSER-RENDERED SOURCE" in sample_text
+
+
+def test_spa_rendered_no_pagination_controls_is_not_required_and_sufficient(monkeypatch):
+    # No load-more/next control in the rendered DOM -> pagination
+    # not_required -> a complete stable listing -> evidence sufficient ->
+    # the graph proceeds to code generation instead of exhausting budget.
+    evidence, _ = _classify_with_plain_http("<html>no jobs</html>", monkeypatch=monkeypatch)
+    assert evidence.pagination_status == PaginationStatus.NOT_REQUIRED
+    assert evidence.india_filter_mechanism == "client_side_fallback"
+    assert evidence.is_sufficient() is True
+
+
+def test_spa_rendered_with_load_more_control_is_unknown_until_driven(monkeypatch):
+    rendered = _RENDERED_JOB_LINKS_HTML + '<button>Load more</button>'
+    evidence, _ = _classify_with_plain_http("<html>no jobs</html>", rendered_html=rendered, monkeypatch=monkeypatch)
+    assert evidence.pagination_status == PaginationStatus.UNKNOWN
+    assert evidence.is_sufficient() is False
+
+
+def test_spa_rendered_load_more_confirmed_when_interaction_drove_it(monkeypatch):
+    rendered = _RENDERED_JOB_LINKS_HTML + '<button>Load more</button>'
+    interactions = [{"action": "click", "target": "load more"}]
+    evidence, _ = _classify_with_plain_http(
+        "<html>no jobs</html>", rendered_html=rendered, interactions=interactions, monkeypatch=monkeypatch
+    )
+    assert evidence.pagination_status == PaginationStatus.CONFIRMED
+    assert evidence.is_sufficient() is True
+
+
+def test_links_surviving_plain_http_stay_ssr_not_spa(monkeypatch):
+    # If the SAME links survive a plain HTTP fetch, it's a true SSR source
+    # (requests scraper), NOT SPA_RENDERED — must not regress that path.
+    evidence, sample_text = _classify_with_plain_http(_RENDERED_JOB_LINKS_HTML, monkeypatch=monkeypatch)
+    assert evidence.source_type == SourceType.SSR_HTML
+    assert evidence.requires_browser is False
+
+
+def test_probe_to_status_maps_single_page_to_not_required():
+    assert inv._probe_to_status({"confirmed": True, "mechanism": "single_page"}) == PaginationStatus.NOT_REQUIRED
+    assert inv._probe_to_status({"confirmed": True, "mechanism": "page number"}) == PaginationStatus.CONFIRMED
+    assert inv._probe_to_status({"confirmed": False, "mechanism": None}) == PaginationStatus.UNKNOWN
 
 
 def test_try_ssr_pagination_confirms_single_page_when_response_unchanged(monkeypatch):

@@ -26,9 +26,12 @@ class Settings(BaseModel):
     # tweak never requires touching sandbox.py (same principle as no
     # hardcoded domains, CLAUDE.md §2 #2)
     sandbox_image: str = os.getenv("SANDBOX_IMAGE", "job-scraper-sandbox")
-    sandbox_memory_limit: str = os.getenv("SANDBOX_MEMORY_LIMIT", "512m")
+    sandbox_memory_limit: str = os.getenv("SANDBOX_MEMORY_LIMIT", "1g")
     sandbox_cpu_limit: str = os.getenv("SANDBOX_CPU_LIMIT", "1")
     sandbox_network: str = os.getenv("SANDBOX_NETWORK", "sandbox_net")
+    # Chromium (for SPA_RENDERED scrapers) crashes with Docker's default 64MB
+    # /dev/shm — give it room. Harmless for non-browser scraper runs.
+    sandbox_shm_size: str = os.getenv("SANDBOX_SHM_SIZE", "1g")
     egress_proxy_host: str = os.getenv("EGRESS_PROXY_HOST", "egress-proxy:3128")
 
     # Paths

@@ -18,7 +18,7 @@ from lxml import html as lxml_html
 from agent.llm.client import llm_client
 from agent.llm.codeformat import extract_json
 from agent.memory.store import compute_site_signature, memory_store, url_structure_shape
-from agent.models.evidence import SourceType
+from agent.models.evidence import PaginationStatus, SourceType
 from agent.models.network import CapturedRequest, parse_captured_request
 from agent.models.validation import FailureCategory
 from agent.nodes import traced
@@ -443,6 +443,70 @@ def _try_ssr_india_filter(url: str, base_links: set) -> Optional[str]:
     return None
 
 
+def _probe_to_status(pagination: dict) -> PaginationStatus:
+    """Map a `_try_*_pagination` probe result onto the richer status enum.
+    "single_page" means the probe proved no pagination is needed (a stable
+    complete listing) — that's NOT_REQUIRED, a valid sufficient state, not
+    the same as a genuinely UNKNOWN scheme.
+    """
+    if not pagination.get("confirmed"):
+        return PaginationStatus.UNKNOWN
+    return PaginationStatus.NOT_REQUIRED if pagination.get("mechanism") == "single_page" else PaginationStatus.CONFIRMED
+
+
+# Generic pagination-affordance markers — a rendered SPA listing that still
+# shows one of these has more records behind it; one that shows none is a
+# complete, stable listing (pagination not_required). Never per-domain.
+PAGINATION_CONTROL_MARKERS = (
+    "load more",
+    "show more",
+    "view more",
+    "next page",
+    "next »",
+    "older",
+    "see more jobs",
+)
+
+
+def _detect_rendered_pagination(html_text: str, interactions: Optional[list] = None) -> dict:
+    """Determine the pagination status of a JS-rendered (SPA) job listing
+    from the *final rendered DOM* — we can't replay a `?page=2` query the
+    way we can for a plain-HTTP source, so status comes from what controls
+    remain and whether the bounded interaction pass exercised any.
+
+    - A "load more"/"next" control was clicked during interaction (evidence
+      it yields more records, and a Playwright scraper can loop it to
+      exhaustion) -> CONFIRMED.
+    - No pagination control present in the final DOM -> NOT_REQUIRED
+      (stable, complete listing).
+    - A control is present but was never exercised -> UNKNOWN (honest: we
+      can't promise full enumeration).
+    """
+    interaction_clicked_more = any(
+        a.get("action") in ("click", "fill_and_enter")
+        and any(m in str(a.get("target", "")).lower() for m in ("load more", "show more", "view more", "view openings", "see all", "next"))
+        for a in (interactions or [])
+    )
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        tree = None
+
+    control_present = False
+    if tree is not None:
+        if tree.xpath("//a[@rel='next'] | //*[@aria-label='Next'] | //*[contains(@class,'pagination')]"):
+            control_present = True
+        else:
+            texts = [t.strip().lower() for t in tree.xpath("//a/text() | //button/text()")]
+            control_present = any(any(m in t for m in PAGINATION_CONTROL_MARKERS) for t in texts)
+
+    if interaction_clicked_more:
+        return {"status": PaginationStatus.CONFIRMED, "mechanism": "load more / infinite scroll (driven in browser)"}
+    if not control_present:
+        return {"status": PaginationStatus.NOT_REQUIRED, "mechanism": None}
+    return {"status": PaginationStatus.UNKNOWN, "mechanism": None}
+
+
 STRIP_TAGS = ("script", "style", "svg", "noscript", "link", "meta")
 
 
@@ -610,7 +674,7 @@ def _classify_pdf_source(url: str, domain: str, run_id: str, findings: dict, evi
 
     findings["pdf_extracted_chars"] = len(result.markdown)
     evidence.source_type = SourceType.SSR_HTML
-    evidence.pagination_param_confirmed = True
+    evidence.pagination_status = PaginationStatus.NOT_REQUIRED
     evidence.pagination_mechanism = "single_page"
     evidence.india_filter_mechanism = "client_side_fallback"
     return (
@@ -670,9 +734,10 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
             "sample_record": best["sample"],
         }
         evidence.source_type = SourceType.REST_API
-        evidence.pagination_param_confirmed = pagination["confirmed"]
+        evidence.pagination_status = _probe_to_status(pagination)
         evidence.pagination_mechanism = pagination["mechanism"]
         evidence.india_filter_mechanism = india_filter or "client_side_fallback"
+        evidence.requires_browser = False
         sample_text = (
             f"Real API endpoint: {best_url}\n\n"
             "Sample JSON record actually returned by this endpoint "
@@ -715,9 +780,10 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
             "sample_record": best["sample"],
         }
         evidence.source_type = SourceType.GRAPHQL if captured.is_graphql else SourceType.REST_API
-        evidence.pagination_param_confirmed = pagination["confirmed"]
+        evidence.pagination_status = _probe_to_status(pagination)
         evidence.pagination_mechanism = pagination["mechanism"]
         evidence.india_filter_mechanism = india_filter or "client_side_fallback"
+        evidence.requires_browser = False
         sample_text = (
             f"Real {'GraphQL' if captured.is_graphql else 'POST'} API endpoint: {captured.url}\n\n"
             f"Observed request body:\n{json.dumps(captured.json_body, indent=2, default=str)}\n\n"
@@ -745,66 +811,96 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
             # no JS engine, per the sandbox's library list — could never
             # replicate. Only trust SSR_HTML if the same job-shaped links
             # actually survive a plain, JS-free HTTP fetch of the same URL.
+            # Do the same job-shaped links survive a plain, JS-free HTTP
+            # fetch? If yes, it's a true SSR source and a cheap requests
+            # scraper works. If no, the links exist ONLY in the rendered
+            # DOM — that's not a dead end, it's a browser-rendered source
+            # (SPA_RENDERED), scrapable by a standalone Playwright script.
             try:
                 plain = probe_endpoint(careers_url)
                 plain_links = _extract_job_links(plain.text_body)
             except Exception:
                 plain_links = set()
 
-            if not (job_links & plain_links):
-                trace_sink.emit(
-                    domain, run_id, type="decision", node="investigate", action="reject_js_rendered_ssr",
-                    rationale=(
-                        f"{len(job_links)} job-shaped link(s) appeared only after JavaScript "
-                        "execution — none survive a plain HTTP fetch of the same URL, so a "
-                        "requests-based scraper could never see them."
-                    ),
-                )
-                return None
-
             ats_hint = next((v for k, v in ATS_HOST_HINTS.items() if k in urlparse(careers_url).netloc), None)
             signature = compute_site_signature(ats_hint, url_structure_shape(job_links))
-            hint_param = memory_store.suggest_pagination_param(signature)
-            if hint_param:
-                trace_sink.emit(
-                    domain, run_id, type="decision", node="investigate", action="use_memory_hint",
-                    rationale=f"Cross-run memory suggests trying pagination param '{hint_param}' first for this site signature.",
-                )
-            trace_sink.emit(
-                domain, run_id, type="tool_call", node="investigate", tool="probe_endpoint",
-                input={"url": careers_url, "purpose": "SSR pagination + india-filter probing"},
-            )
-            pagination = _try_ssr_pagination(careers_url, job_links, hint_param=hint_param)
-            india_filter = _try_ssr_india_filter(careers_url, job_links)
             findings["site_signature"] = signature
-            trace_sink.emit(
-                domain, run_id, type="tool_result", node="investigate", tool="probe_endpoint",
-                pagination=pagination, india_filter_mechanism=india_filter,
-            )
-            findings["ssr_job_link_count"] = len(job_links)
-            findings["ssr_pagination"] = pagination
-            evidence.source_type = SourceType.SSR_HTML
-            evidence.pagination_param_confirmed = pagination["confirmed"]
+            findings["rendered_job_link_count"] = len(job_links)
+            findings["plain_http_job_link_count"] = len(plain_links)
+
+            if job_links & plain_links:
+                # --- True SSR: links present without JS -> requests scraper.
+                hint_param = memory_store.suggest_pagination_param(signature)
+                if hint_param:
+                    trace_sink.emit(
+                        domain, run_id, type="decision", node="investigate", action="use_memory_hint",
+                        rationale=f"Cross-run memory suggests trying pagination param '{hint_param}' first for this site signature.",
+                    )
+                trace_sink.emit(
+                    domain, run_id, type="tool_call", node="investigate", tool="probe_endpoint",
+                    input={"url": careers_url, "purpose": "SSR pagination + india-filter probing"},
+                )
+                pagination = _try_ssr_pagination(careers_url, job_links, hint_param=hint_param)
+                india_filter = _try_ssr_india_filter(careers_url, job_links)
+                trace_sink.emit(
+                    domain, run_id, type="tool_result", node="investigate", tool="probe_endpoint",
+                    pagination=pagination, india_filter_mechanism=india_filter,
+                )
+                findings["ssr_job_link_count"] = len(job_links)
+                findings["ssr_pagination"] = pagination
+                evidence.source_type = SourceType.SSR_HTML
+                evidence.pagination_status = _probe_to_status(pagination)
+                evidence.pagination_mechanism = pagination["mechanism"]
+                evidence.india_filter_mechanism = india_filter or "client_side_fallback"
+                evidence.requires_browser = False
+
+                listing_sample = _sample_job_link_html(fetch_result.html)
+                sample_text = (
+                    "Real job-link anchor elements found on the listing page — the actual "
+                    "href pattern and surrounding markup to write selectors against:\n" + listing_sample
+                )
+                try:
+                    detail_url = urljoin(careers_url, next(iter(job_links)))
+                    detail_probe = probe_endpoint(detail_url)
+                    detail_clean = _clean_html_sample(detail_probe.text_body)
+                    sample_text += "\n\nCleaned real sample job-detail-page HTML:\n" + detail_clean
+                except Exception:
+                    pass
+                trace_sink.emit(
+                    domain, run_id, type="decision", node="investigate", action="classify_ssr_html",
+                    rationale=f"{len(job_links)} job-shaped links present in plain (no-JS) HTML — requests scraper viable.",
+                )
+                return sample_text
+
+            # --- SPA_RENDERED: links exist only after JS renders. Determine
+            # pagination from the rendered DOM (we can't replay ?page=2 on a
+            # JS page), classify, and hand codegen a Playwright-based plan.
+            pagination = _detect_rendered_pagination(fetch_result.html, getattr(fetch_result, "interactions", None))
+            evidence.source_type = SourceType.SPA_RENDERED
+            evidence.pagination_status = pagination["status"]
             evidence.pagination_mechanism = pagination["mechanism"]
-            evidence.india_filter_mechanism = india_filter or "client_side_fallback"
+            evidence.india_filter_mechanism = "client_side_fallback"
+            evidence.requires_browser = True
+            findings["spa_rendered_job_link_count"] = len(job_links)
+            findings["spa_pagination_status"] = pagination["status"].value
 
             listing_sample = _sample_job_link_html(fetch_result.html)
             sample_text = (
-                "Real job-link anchor elements found on the listing page — the actual "
-                "href pattern and surrounding markup to write selectors against:\n" + listing_sample
+                "BROWSER-RENDERED SOURCE (SPA) — these job links appear only AFTER JavaScript "
+                "renders the page; a plain HTTP fetch of the same URL returns none of them. The "
+                "generated scraper MUST use Playwright to load and render the page, then extract "
+                f"jobs from the rendered DOM. Pagination status: {pagination['status'].value}"
+                f"{' (mechanism: ' + pagination['mechanism'] + ')' if pagination['mechanism'] else ''}.\n\n"
+                "Real job-link anchor elements from the rendered listing DOM — the actual href "
+                "pattern and surrounding markup to write selectors against:\n" + listing_sample
             )
-
-            try:
-                detail_url = urljoin(careers_url, next(iter(job_links)))
-                detail_probe = probe_endpoint(detail_url)
-                detail_clean = _clean_html_sample(detail_probe.text_body)
-                sample_text += "\n\nCleaned real sample job-detail-page HTML:\n" + detail_clean
-            except Exception:
-                pass
-
             trace_sink.emit(
-                domain, run_id, type="decision", node="investigate", action="classify_ssr_html",
-                rationale=f"No JSON API found, but {len(job_links)} job-shaped anchor links were in the raw HTML.",
+                domain, run_id, type="decision", node="investigate", action="classify_spa_rendered",
+                rationale=(
+                    f"{len(job_links)} job-shaped links exist only in the rendered DOM (0 survive plain "
+                    f"HTTP) — classified SPA_RENDERED, pagination {pagination['status'].value}. A standalone "
+                    "Playwright scraper is a valid source."
+                ),
             )
             return sample_text
         return None
@@ -962,7 +1058,7 @@ def investigate(state: AgentState) -> AgentState:
 
         if sample_text is None:
             evidence.source_type = SourceType.SPA_NO_API
-            evidence.pagination_param_confirmed = False
+            evidence.pagination_status = PaginationStatus.UNKNOWN
             evidence.india_filter_mechanism = "client_side_fallback"
             trace_sink.emit(
                 domain, run_id, type="decision", node="investigate", action="classify_spa_no_api",
@@ -1021,8 +1117,9 @@ def _finish_investigation(state: AgentState, evidence, findings: dict, careers_u
         domain, run_id, type="evidence", node="investigate",
         source_type=evidence.source_type.value if evidence.source_type else None,
         endpoint=careers_url,
+        pagination_status=evidence.pagination_status.value if evidence.pagination_status else None,
         pagination_mechanism=evidence.pagination_mechanism,
-        pagination_param_confirmed=evidence.pagination_param_confirmed,
+        requires_browser=evidence.requires_browser,
         india_filter_mechanism=evidence.india_filter_mechanism,
         reported_total_count=evidence.reported_total_count,
         sufficient=evidence.is_sufficient(),
@@ -1070,7 +1167,7 @@ def _finish_investigation(state: AgentState, evidence, findings: dict, careers_u
         for x in (
             evidence.source_type.value if evidence.source_type else None,
             careers_url,
-            evidence.pagination_param_confirmed,
+            evidence.pagination_status.value if evidence.pagination_status else None,
             evidence.pagination_mechanism,
             evidence.india_filter_mechanism,
             evidence.reported_total_count,

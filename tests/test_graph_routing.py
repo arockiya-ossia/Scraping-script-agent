@@ -1,5 +1,5 @@
 from agent.graph import _route_evidence, _route_repair, _route_validation
-from agent.models.evidence import InvestigationEvidence, SourceType
+from agent.models.evidence import InvestigationEvidence, PaginationStatus, SourceType
 from agent.models.validation import FailureCategory, ValidationReport
 from agent.nodes.evidence_check import evidence_check
 
@@ -32,7 +32,7 @@ def test_route_evidence_sufficient_does_not_touch_budget():
     evidence = InvestigationEvidence(
         careers_url="https://example.com/careers",
         source_type=SourceType.REST_API,
-        pagination_param_confirmed=True,
+        pagination_status=PaginationStatus.CONFIRMED,
         india_filter_mechanism="query param country=IN",
     )
     state = _state(evidence=evidence, total_attempts=8)
@@ -45,6 +45,22 @@ def test_route_evidence_budget_exhausted_routes_to_finalize():
     state = _state(evidence=InvestigationEvidence(), total_attempts=0)
     state = evidence_check(state)
     assert _route_evidence(state) == "budget_exhausted"
+
+
+def test_route_evidence_spa_rendered_not_required_proceeds_to_codegen():
+    # A browser-rendered source with enumerable links and pagination
+    # not_required is sufficient — the graph must proceed to generate_script,
+    # not loop investigating or exhaust the budget (the F22 false-negative).
+    evidence = InvestigationEvidence(
+        careers_url="https://acme.zohorecruit.in/jobs/Careers",
+        source_type=SourceType.SPA_RENDERED,
+        pagination_status=PaginationStatus.NOT_REQUIRED,
+        india_filter_mechanism="client_side_fallback",
+        requires_browser=True,
+    )
+    state = _state(evidence=evidence, total_attempts=5)
+    state = evidence_check(state)
+    assert _route_evidence(state) == "sufficient"
 
 
 def test_route_evidence_stagnant_routes_to_finalize_even_with_budget_left():

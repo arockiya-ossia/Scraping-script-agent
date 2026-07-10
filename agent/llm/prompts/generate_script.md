@@ -20,17 +20,42 @@ extraction code for it (it may appear on other job postings), but never
 invent a selector you can't tie back to something in the sample or the
 evidence above.
 
+## Choose the right fetch strategy from `source_type` / `requires_browser`
+
+- If `requires_browser` is `true` (source_type `spa_rendered`): the job
+  listing exists ONLY after JavaScript renders — a plain `requests`/`httpx`
+  fetch returns none of it. You **must** use **Playwright** (sync API) to
+  launch Chromium, `page.goto(url, wait_until="networkidle")`, then extract
+  jobs from `page.content()` (parse with `lxml`) or via `page.query_selector_all`.
+  - Launch Chromium headless with
+    `args=["--no-sandbox", "--disable-dev-shm-usage"]` (required to run as
+    root inside Docker) and, if `os.environ.get("HTTPS_PROXY")` is set, pass
+    `proxy={"server": os.environ["HTTPS_PROXY"]}` to
+    `p.chromium.launch(...)` so egress goes through the sandbox proxy.
+    Use the **sync** API (`from playwright.sync_api import sync_playwright`).
+  - If `pagination_status` is `not_required`, one rendered page is the
+    complete listing — do NOT invent a pagination loop. If it is `confirmed`
+    (a "load more"/"next" control), loop: click the control and wait, until
+    it disappears or the job count stops growing (cap the loop, e.g. 50
+    iterations, so a broken control can't spin forever).
+  - Individual job-detail pages may be plain-HTTP fetchable even when the
+    listing isn't — you may use `requests` for detail pages if that's
+    simpler, but the LISTING enumeration must go through Playwright.
+- Otherwise (`requires_browser` false — API or true SSR): use
+  `requests`/`httpx` + `lxml`/`jmespath`. Do NOT use Playwright for these;
+  it's slower and unnecessary.
+
 ## Hard requirements
 
 - Output must be a single, self-contained Python file runnable as
   `python scraper.py > output.jsonl` with no dependency on this agent process
   and **no LLM calls at runtime**.
-- Only these libraries are available in the sandbox: `requests`/`httpx`,
-  `lxml`, `cssselect`, `jmespath`, `python-dateutil`, `pydantic`, `pycountry`,
-  `pypdf` (only if the evidence explicitly says the source is a PDF — fetch
-  the PDF URL directly with `requests`/`httpx` and parse it with
-  `pypdf.PdfReader`; never call any external scraping/parsing API from the
-  generated script itself).
+- Available libraries in the sandbox: `requests`/`httpx`, `lxml`, `cssselect`,
+  `jmespath`, `python-dateutil`, `pydantic`, `pycountry`, `playwright` (sync
+  API; browsers are pre-installed — use ONLY when `requires_browser` is true),
+  and `pypdf` (only if the evidence says the source is a PDF — fetch the PDF
+  URL directly and parse with `pypdf.PdfReader`). Never call any external
+  scraping/parsing API (Firecrawl, etc.) from the generated script itself.
 - **Never use `re` or regex** for field extraction. Use CSS selectors
   (`lxml`/`cssselect`) or JSON paths (`jmespath`) only.
 - Prefer server-side India filtering (the confirmed query param) over

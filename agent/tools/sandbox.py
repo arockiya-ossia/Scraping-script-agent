@@ -52,10 +52,14 @@ def run_script(script_path: Path, output_dir: Path, domain: str) -> SandboxRunRe
         f"http_proxy={proxy_url}",
         "-e",
         f"https_proxy={proxy_url}",
+        "-e",
+        "HOME=/tmp",  # writable scratch for Chromium's profile/cache dirs (root fs is read-only)
         "--memory",
         settings.sandbox_memory_limit,
         "--cpus",
         settings.sandbox_cpu_limit,
+        "--shm-size",
+        settings.sandbox_shm_size,  # Chromium needs >64MB /dev/shm or it crashes
         "--read-only",
         "--tmpfs",
         "/tmp",
