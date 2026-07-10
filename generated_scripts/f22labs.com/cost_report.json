@@ -1,0 +1,9 @@
+{
+  "domain": "f22labs.com",
+  "status": "failed",
+  "repair_attempts": 0,
+  "total_attempts_used": 2,
+  "tokens_prompt": 1349,
+  "tokens_completion": 659,
+  "firecrawl_credits_used": 1
+}

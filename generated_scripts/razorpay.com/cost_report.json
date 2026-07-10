@@ -1,0 +1,9 @@
+{
+  "domain": "razorpay.com",
+  "status": "success",
+  "repair_attempts": 1,
+  "total_attempts_used": 1,
+  "tokens_prompt": 7688,
+  "tokens_completion": 5181,
+  "firecrawl_credits_used": 0
+}

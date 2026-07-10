@@ -1,0 +1,9 @@
+{
+  "domain": "infosys.com",
+  "status": "success",
+  "repair_attempts": 5,
+  "total_attempts_used": 5,
+  "tokens_prompt": 16830,
+  "tokens_completion": 17263,
+  "firecrawl_credits_used": 0
+}

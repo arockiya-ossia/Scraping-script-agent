@@ -3,7 +3,6 @@ __pycache__/
 .venv/
 venv/
 .env
-generated_scripts/
 traces/
 artifacts/
 agent/memory/learned_patterns.json
