@@ -4,6 +4,7 @@ output (CLAUDE.md §11). Cheapest checks first so a bad script fails fast.
 
 import ast
 import json
+from pathlib import Path
 
 import httpx
 from pydantic import ValidationError
@@ -81,6 +82,33 @@ def check_no_mojibake(records: list[JobRecord]) -> bool:
     return True
 
 
+def write_confidence_sidecar(records: list[JobRecord], non_null_rates: dict[str, float], output_path: str) -> str:
+    """Per-field confidence scoring (CLAUDE.md §12 stretch goal): a sidecar
+    file, not an extension of the fixed JobRecord schema.
+
+    Computed heuristically from the same non_null_rates the validator
+    already builds: a field's non-null rate *across the whole dataset* is
+    a proxy for how reliably its selector/path works — a selector that
+    matched consistently for every sampled job scores high; one that only
+    occasionally produced a value (a fallback/best-effort path, or a field
+    genuinely absent for most postings) scores lower. Per job, a field's
+    confidence is that dataset-wide rate when the value is actually
+    present for that job, or 0.0 when it's missing (nothing to be
+    confident about).
+    """
+    sidecar: dict[str, dict[str, float]] = {}
+    for i, record in enumerate(records):
+        key = record.job_id or f"_row_{i}"
+        dumped = record.model_dump()
+        sidecar[key] = {
+            field: (non_null_rates.get(field, 0.0) if value is not None else 0.0)
+            for field, value in dumped.items()
+        }
+    confidence_path = Path(output_path).with_name("confidence.json")
+    confidence_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+    return str(confidence_path)
+
+
 def validate_output(
     script_source: str,
     output_path: str,
@@ -136,6 +164,12 @@ def validate_output(
     for field in JobRecord.model_fields:
         non_null = sum(1 for r in records if getattr(r, field) is not None)
         non_null_rates[field] = non_null / row_count
+
+    # Written here — before any of the checks below that can still fail —
+    # so a run that fails a *later* check (country_code purity, mojibake)
+    # still leaves useful per-field diagnostic data behind, not just a
+    # failure category.
+    write_confidence_sidecar(records, non_null_rates, output_path)
 
     for required in ("title", "job_id", "url"):
         if non_null_rates[required] < 0.5:

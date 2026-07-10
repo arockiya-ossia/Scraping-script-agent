@@ -1,7 +1,7 @@
 import json
 
 from agent.models.job_record import JobRecord
-from agent.tools.validator import check_no_mojibake, check_no_regex, validate_output
+from agent.tools.validator import check_no_mojibake, check_no_regex, validate_output, write_confidence_sidecar
 
 
 def test_requests_import_is_not_a_false_positive():
@@ -72,3 +72,56 @@ def test_validate_output_flags_mojibake_as_failure_category(tmp_path):
     report = validate_output(script_source="import requests\n", output_path=str(output_path), spot_check=False)
     assert report.passed is False
     assert report.failure_category.value == "mojibake_encoding"
+
+
+def test_write_confidence_sidecar_keys_by_job_id(tmp_path):
+    records = [
+        JobRecord(job_id="1", title="Engineer", city="Bengaluru"),
+        JobRecord(job_id="2", title="Manager", city=None),
+    ]
+    non_null_rates = {"title": 1.0, "city": 0.5, "job_id": 1.0}
+    output_path = tmp_path / "output.jsonl"
+    path = write_confidence_sidecar(records, non_null_rates, str(output_path))
+    assert path == str(tmp_path / "confidence.json")
+    sidecar = json.loads((tmp_path / "confidence.json").read_text(encoding="utf-8"))
+    assert set(sidecar.keys()) == {"1", "2"}
+
+
+def test_write_confidence_sidecar_present_field_gets_dataset_rate(tmp_path):
+    records = [JobRecord(job_id="1", title="Engineer")]
+    non_null_rates = {"title": 0.9}
+    output_path = tmp_path / "output.jsonl"
+    write_confidence_sidecar(records, non_null_rates, str(output_path))
+    sidecar = json.loads((tmp_path / "confidence.json").read_text(encoding="utf-8"))
+    assert sidecar["1"]["title"] == 0.9
+
+
+def test_write_confidence_sidecar_missing_field_is_zero(tmp_path):
+    records = [JobRecord(job_id="1", title=None)]
+    non_null_rates = {"title": 0.7}  # dataset-wide rate is high...
+    output_path = tmp_path / "output.jsonl"
+    write_confidence_sidecar(records, non_null_rates, str(output_path))
+    sidecar = json.loads((tmp_path / "confidence.json").read_text(encoding="utf-8"))
+    # ...but THIS job's title is missing, so its confidence is 0, not 0.7.
+    assert sidecar["1"]["title"] == 0.0
+
+
+def test_write_confidence_sidecar_falls_back_to_row_index_without_job_id(tmp_path):
+    records = [JobRecord(job_id=None, title="Engineer")]
+    output_path = tmp_path / "output.jsonl"
+    write_confidence_sidecar(records, {"title": 1.0}, str(output_path))
+    sidecar = json.loads((tmp_path / "confidence.json").read_text(encoding="utf-8"))
+    assert "_row_0" in sidecar
+
+
+def test_validate_output_writes_confidence_sidecar_even_on_later_failure(tmp_path):
+    # A run that fails a LATER check (non-IN country code) should still
+    # leave the per-field confidence data behind — it's diagnostic
+    # information independent of the overall pass/fail verdict.
+    records = [{"title": "Engineer", "job_id": "1", "url": "https://example.com/1", "country_code": "US"}]
+    output_path = tmp_path / "output.jsonl"
+    output_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+    report = validate_output(script_source="import requests\n", output_path=str(output_path), spot_check=False)
+    assert report.passed is False
+    assert (tmp_path / "confidence.json").exists()

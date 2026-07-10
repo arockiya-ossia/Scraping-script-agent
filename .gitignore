@@ -6,6 +6,7 @@ venv/
 generated_scripts/
 traces/
 artifacts/
+agent/memory/learned_patterns.json
 .pytest_cache/
 *.egg-info/
 .ruff_cache/

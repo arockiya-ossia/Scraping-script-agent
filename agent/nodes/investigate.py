@@ -17,6 +17,7 @@ from lxml import html as lxml_html
 
 from agent.llm.client import llm_client
 from agent.llm.codeformat import extract_json
+from agent.memory.store import compute_site_signature, memory_store, url_structure_shape
 from agent.models.evidence import SourceType
 from agent.models.network import CapturedRequest, parse_captured_request
 from agent.models.validation import FailureCategory
@@ -133,9 +134,14 @@ def _url_with_params(url: str, overrides: dict) -> str:
     return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
 
-def _try_pagination_params(url: str) -> dict:
+def _try_pagination_params(url: str, hint_param: Optional[str] = None) -> dict:
     """Empirically test common pagination param names — confirmed only if
     the result set actually changes, never guessed (CLAUDE.md §6.2).
+
+    `hint_param` (from cross-run memory, §12 stretch goal) just reorders
+    which trial runs first — a prior guess to check first, never a
+    substitute for the empirical diff below. A stale/wrong hint simply
+    misses and the rest of the trial list runs exactly as before.
     """
     try:
         base = probe_endpoint(url)
@@ -151,6 +157,8 @@ def _try_pagination_params(url: str) -> dict:
         ("offset", "offset/limit", {"offset": len(base_jobs), "limit": len(base_jobs)}),
         ("start", "offset/limit", {"start": len(base_jobs)}),
     ]
+    if hint_param:
+        trials.sort(key=lambda t: t[0] != hint_param)
     for param, mechanism, overrides in trials:
         try:
             probed = probe_endpoint(_url_with_params(url, overrides))
@@ -385,7 +393,7 @@ def _extract_job_links(html_text: str) -> set:
     }
 
 
-def _try_ssr_pagination(url: str, base_links: set) -> dict:
+def _try_ssr_pagination(url: str, base_links: set, hint_param: Optional[str] = None) -> dict:
     """Empirically test common HTML pagination query params. A page-2 fetch
     that returns a *different* link set confirms multi-page pagination; one
     that returns an *empty* set confirms all jobs already fit on one page.
@@ -393,12 +401,17 @@ def _try_ssr_pagination(url: str, base_links: set) -> dict:
     every param variant — many single-listing ATS pages (e.g. Lever) simply
     ignore unrecognized query params and always return the full listing,
     rather than erroring or emptying out.
+
+    `hint_param` (cross-run memory, §12) just reorders the trial list.
     """
     if not base_links:
         return {"confirmed": False, "mechanism": None, "param": None}
     any_success = False
     always_same = True
-    for param in ("page", "p", "pg"):
+    param_order = ("page", "p", "pg")
+    if hint_param in param_order:
+        param_order = (hint_param,) + tuple(p for p in param_order if p != hint_param)
+    for param in param_order:
         try:
             probed = probe_endpoint(_url_with_params(url, {param: 2}))
             probed_links = _extract_job_links(probed.text_body)
@@ -630,12 +643,21 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
     if best_overall and best_overall["captured"].method == "GET":
         best = best_overall
         best_url = best["captured"].url
+        ats_hint = next((v for k, v in ATS_HOST_HINTS.items() if k in urlparse(careers_url).netloc), None)
+        signature = compute_site_signature(ats_hint, best["sample"])
+        hint_param = memory_store.suggest_pagination_param(signature)
+        if hint_param:
+            trace_sink.emit(
+                domain, run_id, type="decision", node="investigate", action="use_memory_hint",
+                rationale=f"Cross-run memory suggests trying pagination param '{hint_param}' first for this site signature.",
+            )
         trace_sink.emit(
             domain, run_id, type="tool_call", node="investigate", tool="probe_endpoint",
             input={"url": best_url, "purpose": "pagination + india-filter probing"},
         )
-        pagination = _try_pagination_params(best_url)
+        pagination = _try_pagination_params(best_url, hint_param=hint_param)
         india_filter = _try_india_filter(best_url)
+        findings["site_signature"] = signature
         trace_sink.emit(
             domain, run_id, type="tool_result", node="investigate", tool="probe_endpoint",
             pagination=pagination, india_filter_mechanism=india_filter,
@@ -740,12 +762,21 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
                 )
                 return None
 
+            ats_hint = next((v for k, v in ATS_HOST_HINTS.items() if k in urlparse(careers_url).netloc), None)
+            signature = compute_site_signature(ats_hint, url_structure_shape(job_links))
+            hint_param = memory_store.suggest_pagination_param(signature)
+            if hint_param:
+                trace_sink.emit(
+                    domain, run_id, type="decision", node="investigate", action="use_memory_hint",
+                    rationale=f"Cross-run memory suggests trying pagination param '{hint_param}' first for this site signature.",
+                )
             trace_sink.emit(
                 domain, run_id, type="tool_call", node="investigate", tool="probe_endpoint",
                 input={"url": careers_url, "purpose": "SSR pagination + india-filter probing"},
             )
-            pagination = _try_ssr_pagination(careers_url, job_links)
+            pagination = _try_ssr_pagination(careers_url, job_links, hint_param=hint_param)
             india_filter = _try_ssr_india_filter(careers_url, job_links)
+            findings["site_signature"] = signature
             trace_sink.emit(
                 domain, run_id, type="tool_result", node="investigate", tool="probe_endpoint",
                 pagination=pagination, india_filter_mechanism=india_filter,
@@ -998,5 +1029,33 @@ def _finish_investigation(state: AgentState, evidence, findings: dict, careers_u
         confidence=_evidence_confidence(evidence),
         notes=evidence.evidence_notes,
     )
+
+    # Cross-run memory (CLAUDE.md §12): only recorded once evidence is
+    # actually sufficient — i.e. pagination_param_confirmed came from a
+    # real probe diff, not a guess — so a future run against a different
+    # domain on the same platform gets a head start, never a shortcut
+    # around empirical confirmation.
+    signature = findings.get("site_signature")
+    if signature and evidence.is_sufficient():
+        api_candidate = findings.get("api_candidate")
+        ssr_pagination = findings.get("ssr_pagination")
+        if isinstance(api_candidate, dict):
+            pagination_param = (api_candidate.get("pagination") or {}).get("param")
+        elif isinstance(ssr_pagination, dict):
+            pagination_param = ssr_pagination.get("param")
+        else:
+            pagination_param = None
+        memory_store.record(
+            signature,
+            source_type=evidence.source_type.value if evidence.source_type else None,
+            pagination_mechanism=evidence.pagination_mechanism,
+            pagination_param=pagination_param,
+            india_filter_mechanism=evidence.india_filter_mechanism,
+            ats_hint=findings.get("ats_hint"),
+        )
+        trace_sink.emit(
+            domain, run_id, type="decision", node="investigate", action="record_memory",
+            rationale=f"Recorded learned pattern for site signature {signature}.",
+        )
 
     return state
