@@ -1,0 +1,9 @@
+{
+  "domain": "simplyhired.co.in",
+  "status": "failed",
+  "repair_attempts": 0,
+  "total_attempts_used": 3,
+  "tokens_prompt": 1883,
+  "tokens_completion": 843,
+  "firecrawl_credits_used": 0
+}

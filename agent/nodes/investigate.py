@@ -41,14 +41,27 @@ JOB_ID_KEYS = ("id", "jobid", "requisitionid", "reqid", "postingid")
 # denylist, not per-company logic (CLAUDE.md §2 #2).
 NON_JOB_API_HOST_MARKERS = (
     "onetrust.com",
+    "cookielaw.org",  # OneTrust consent CDN — consent config JSON trips the job-shape heuristic
+    "cookiebot.com",
     "google-analytics.com",
+    "googletagmanager.com",
+    "gstatic.com",
     "doubleclick.net",
+    "demdex.net",  # Adobe Audience Manager — id-sync JSON, not jobs
+    "omtrdc.net",  # Adobe Analytics
+    "2o7.net",  # Adobe Analytics (legacy)
+    "adobedtm.com",  # Adobe DTM / Launch tag manager
+    "everesttech.net",  # Adobe Advertising
     "segment.com",
     "segment.io",
     "clarity.ms",
+    "hotjar.com",
+    "hotjar.io",
     "factors.ai",
     "zoominfo.com",
     "linkedin.com",
+    "facebook.com",
+    "facebook.net",
     "podscribe.com",
     "liadm.com",
     "contentsquare.net",
@@ -56,6 +69,16 @@ NON_JOB_API_HOST_MARKERS = (
     "framer.com",
     "zi-scripts.com",
     "piwik.pro",
+    "newrelic.com",
+    "nr-data.net",
+    "cloudflareinsights.com",
+    "optimizely.com",
+    "qualtrics.com",
+    "6sense.com",
+    "demandbase.com",
+    "bing.com",
+    "bizible.com",
+    "mouseflow.com",
 )
 
 # Generic ATS response-shape hints — a horizontal pattern used across

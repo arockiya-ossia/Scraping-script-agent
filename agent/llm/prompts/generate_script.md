@@ -30,7 +30,7 @@ evidence above.
   - Launch Chromium headless with
     `args=["--no-sandbox", "--disable-dev-shm-usage"]` (required to run as
     root inside Docker) and, if `os.environ.get("HTTPS_PROXY")` is set, pass
-    `proxy={"server": os.environ["HTTPS_PROXY"]}` to
+    `proxy={{"server": os.environ["HTTPS_PROXY"]}}` to
     `p.chromium.launch(...)` so egress goes through the sandbox proxy.
     Use the **sync** API (`from playwright.sync_api import sync_playwright`).
   - If `pagination_status` is `not_required`, one rendered page is the

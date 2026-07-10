@@ -187,6 +187,22 @@ def test_looks_like_job_list_returns_none_for_non_job_data():
     assert inv._looks_like_job_list({"facets": {"shifttype": [{"name": "x", "count": 1}]}}) is None
 
 
+def test_find_json_api_candidates_skips_tracking_and_consent_hosts():
+    # A cookie-consent config (OneTrust CDN) and an Adobe id-sync payload both
+    # carry title/description-keyed arrays that trip the job-shape heuristic.
+    # They must be filtered by host BEFORE classification, or the agent picks
+    # a tracking endpoint as the "REST API" (the infosys/cognizant bug).
+    job_shaped = json.dumps({"jobs": [{"id": 1, "title": "Engineer"}, {"id": 2, "title": "Manager"}]})
+    reqs = [
+        {"url": "https://cdn.cookielaw.org/consent/abc/en.json", "method": "GET", "status": 200, "body": job_shaped},
+        {"url": "https://dpm.demdex.net/id?d_rtbd=json", "method": "GET", "status": 200, "body": job_shaped},
+        {"url": "https://www.example.com/api/jobs", "method": "GET", "status": 200, "body": job_shaped},
+    ]
+    candidates = inv._find_json_api_candidates(reqs)
+    urls = [c["captured"].url for c in candidates]
+    assert urls == ["https://www.example.com/api/jobs"]
+
+
 def test_find_key_recursive_finds_nested_cursor():
     payload = {"data": {"jobs": {"pageInfo": {"endCursor": "xyz789", "hasNextPage": True}}}}
     assert inv._find_key_recursive(payload, {"endcursor"}) == "xyz789"
