@@ -54,3 +54,15 @@ def test_is_strong_careers_url_recognizes_subdomain_and_ats():
     assert _is_strong_careers_url("https://jobs.example.com/all")
     assert _is_strong_careers_url("https://boards.greenhouse.io/example")
     assert not _is_strong_careers_url("https://www.example.com/us-en/careers")
+
+
+def test_careers_keyword_subdomain_outranks_bare_path_guess():
+    # The infosys regression: the real host `digitalcareers.infosys.com`
+    # carries "careers" in the subdomain but isn't an exact `careers` label —
+    # it must still outrank a bare `infosys.com/jobs` common-path guess, or
+    # discovery lands on a 403 dead end instead of the real careers portal.
+    real = "https://digitalcareers.infosys.com/infosys/global-careers?location=USA"
+    bare_guess = "https://infosys.com/jobs"
+    assert _is_strong_careers_url(real)
+    assert not _is_strong_careers_url(bare_guess)
+    assert _rank(real) < _rank(bare_guess)

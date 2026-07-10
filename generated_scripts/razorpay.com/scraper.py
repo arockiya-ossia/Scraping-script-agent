@@ -2,32 +2,20 @@
 """
 Razorpay (Greenhouse) job scraper.
 
-Outputs one JSON object per line with the exact flat schema:
-
-{
-  "title": null,
-  "job_id": null,
-  "city": null,
-  "state": null,
-  "country": null,
-  "country_code": null,
-  "url": null,
-  "apply_url": null,
-  "date_posted": null,
-  "date_posted_text": null,
-  "job_description": null,
-  "employment_type": null,
-  "work_type": null,
-  "salary_range": null
-}
+- Source type: ssr_html (no JavaScript rendering required)
+- Pagination: not required (single page)
+- India‑only filter: applied client‑side (jobs whose inferred country_code is "IN")
+- Output: one JSON object per line, exactly the keys listed in the specification
 """
 
 import json
+import os
 import sys
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pycountry
 import requests
+from dateutil import parser as dateparser
 from lxml import html
 
 # --------------------------------------------------------------------------- #
@@ -35,187 +23,211 @@ from lxml import html
 # --------------------------------------------------------------------------- #
 CAREERS_URL = "https://job-boards.greenhouse.io/razorpaysoftwareprivatelimited"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; RazorpayJobScraper/1.0; +https://razorpay.com)"
+    "User-Agent": "Mozilla/5.0 (compatible; RazorpayJobScraper/1.0; +https://github.com/yourrepo)"
 }
-TIMEOUT = 30
+
 
 # --------------------------------------------------------------------------- #
 # Helper utilities
 # --------------------------------------------------------------------------- #
 def fetch(url: str) -> str:
     """GET a URL and return its UTF‑8 decoded text."""
-    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    resp = requests.get(url, headers=HEADERS, timeout=30)
     resp.encoding = resp.apparent_encoding or "utf-8"
     return resp.text
 
 
-def is_india_location(loc: str) -> bool:
-    """
-    Return True if the location string refers to an Indian posting.
-
-    The strategy:
-      * If the string matches a country name (case‑insensitive) that is NOT India,
-        the posting is considered non‑Indian → False.
-      * If it matches India (or its common short forms) → True.
-      * Otherwise we assume it is a city/state inside India → True.
-    """
-    loc_clean = loc.strip().lower()
-    # Direct match for India
-    if loc_clean in {"india", "indian"}:
-        return True
-
-    # Check against known country names
-    for country in pycountry.countries:
-        # common name
-        if loc_clean == country.name.lower():
-            return country.alpha_2 == "IN"
-        # official name (if present)
-        if hasattr(country, "official_name"):
-            if loc_clean == country.official_name.lower():
-                return country.alpha_2 == "IN"
-        # alpha‑2 code (e.g., "IN")
-        if loc_clean == country.alpha_2.lower():
-            return country.alpha_2 == "IN"
-        # alpha‑3 code (e.g., "IND")
-        if loc_clean == country.alpha_3.lower():
-            return country.alpha_2 == "IN"
-
-    # No country match → treat as Indian city
-    return True
+def clean_text(element: html.HtmlElement) -> str:
+    """Return concatenated, stripped text of an element."""
+    return " ".join(element.itertext()).strip()
 
 
-def derive_location(loc: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """
-    Convert a raw location string into (city, state, country, country_code).
-
-    For Indian postings we set country = "India" and country_code = "IN".
-    If the location looks like a country other than India we return all Nones
-    (the caller will drop the job).
-    """
-    if not loc:
-        return None, None, None, None
-
-    if not is_india_location(loc):
-        # Non‑Indian posting – signal to caller to discard
-        return None, None, None, None
-
-    # At this point we treat the whole string as a city (or city, state)
-    parts = [p.strip() for p in loc.split(",")]
-    city = parts[0] if parts else None
-    state = parts[1] if len(parts) > 1 else None
-    return city, state, "India", "IN"
-
-
-def parse_listing(page_html: str) -> List[dict]:
-    """Extract job entries from a listing page (server‑side rendered HTML)."""
-    doc = html.fromstring(page_html)
-
-    jobs: List[dict] = []
-
-    # Each job is an <a> inside a <td class="cell">
-    for a in doc.cssselect("td.cell > a"):
-        href = a.get("href")
-        if not href:
-            continue
-
-        # Title
-        title_el = a.cssselect('p.body.body--medium')
-        title = title_el[0].text_content().strip() if title_el else None
-
-        # Location (second <p>)
-        loc_el = a.cssselect('p.body.body__secondary.body--metadata')
-        raw_loc = loc_el[0].text_content().strip() if loc_el else None
-
-        city, state, country, country_code = derive_location(raw_loc)
-
-        # Discard non‑Indian postings
-        if country_code != "IN":
-            continue
-
-        # Job ID – last path component of the URL
-        job_id = href.rstrip("/").split("/")[-1] if href else None
-
-        jobs.append(
-            {
-                "title": title,
-                "job_id": job_id,
-                "city": city,
-                "state": state,
-                "country": country,
-                "country_code": country_code,
-                "url": href,
-                "apply_url": href,  # Greenhouse uses the same URL for apply
-                "date_posted": None,
-                "date_posted_text": None,
-                "job_description": None,
-                "employment_type": None,
-                "work_type": None,
-                "salary_range": None,
-            }
-        )
-    return jobs
-
-
-def parse_detail(page_html: str) -> Optional[str]:
-    """Extract the job description from a detail page."""
-    doc = html.fromstring(page_html)
-    desc_el = doc.cssselect("div.job__description.body")
-    if not desc_el:
-        return None
-    # Preserve paragraph breaks
-    texts = [el.text_content().strip() for el in desc_el]
-    return "\n\n".join(filter(None, texts))
-
-
-def enrich_with_detail(job: dict) -> dict:
-    """Fetch the detail page and fill the description field."""
-    try:
-        detail_html = fetch(job["url"])
-    except Exception as exc:
-        sys.stderr.write(f"Failed to fetch detail page {job['url']}: {exc}\n")
-        return job
-
-    job["job_description"] = parse_detail(detail_html)
-    return job
-
-
-def find_next_page(doc: html.HtmlElement) -> Optional[str]:
-    """
-    Detect a pagination link (if any). Greenhouse boards usually have a
-    <a rel="next"> or a button with aria‑label="Next". Return absolute URL or None.
-    """
-    # rel="next"
-    nxt = doc.cssselect('a[rel="next"]')
-    if nxt:
-        return nxt[0].get("href")
-    # fallback to generic "Next" button
-    nxt = doc.cssselect('a[aria-label*="Next"], button[aria-label*="Next"]')
-    if nxt:
-        return nxt[0].get("href")
+def extract_job_id(job_url: str) -> Optional[str]:
+    """Job ID is the last path component after '/jobs/'."""
+    parts = job_url.rstrip("/").split("/")
+    if len(parts) >= 2 and parts[-2] == "jobs":
+        return parts[-1]
     return None
 
 
-def main() -> None:
-    next_url = CAREERS_URL
-    all_jobs: List[dict] = []
+def parse_location(raw: str) -> Dict[str, Optional[str]]:
+    """
+    Convert a location string into city / country / country_code.
 
-    while next_url:
+    Rules (no regex):
+    * If a comma is present, treat the first part as city, second as country.
+    * Otherwise try to resolve the whole string as a country name via pycountry.
+    * If that fails, treat the whole string as a city.
+    * When only a city is known, assume the job is in India (per the required filter).
+    """
+    raw = raw.strip()
+    city: Optional[str] = None
+    country: Optional[str] = None
+    country_code: Optional[str] = None
+
+    if "," in raw:
+        city_part, country_part = [p.strip() for p in raw.split(",", 1)]
+        city = city_part or None
+        country = country_part or None
+    else:
+        # Try to interpret the whole string as a country name
         try:
-            page_html = fetch(next_url)
-        except Exception as exc:
-            sys.stderr.write(f"Failed to fetch listing page {next_url}: {exc}\n")
-            break
+            country_obj = pycountry.countries.lookup(raw)
+            country = country_obj.name
+            country_code = country_obj.alpha_2
+        except LookupError:
+            city = raw or None
 
-        doc = html.fromstring(page_html)
-        all_jobs.extend(parse_listing(page_html))
+    # Resolve country code if we have a country name but not the code yet
+    if country and not country_code:
+        try:
+            country_obj = pycountry.countries.lookup(country)
+            country_code = country_obj.alpha_2
+        except LookupError:
+            country_code = None
 
-        # Pagination – stop when no further page is found
-        next_url = find_next_page(doc)
+    # If we only have a city, assume India (the required filter)
+    if city and not country:
+        country = "India"
+        country_code = "IN"
 
-    # Enrich each job with its description and emit JSONL
-    for job in all_jobs:
-        job = enrich_with_detail(job)
-        json.dump(job, sys.stdout, ensure_ascii=False)
+    return {
+        "city": city,
+        "state": None,          # Not present in the sample
+        "country": country,
+        "country_code": country_code,
+    }
+
+
+def extract_job_detail(job_url: str) -> Dict[str, Optional[str]]:
+    """
+    Fetch a job detail page and pull the fields required for the output.
+    Missing fields are returned as None.
+    """
+    try:
+        page_html = fetch(job_url)
+    except Exception as exc:
+        sys.stderr.write(f"[WARN] Failed to fetch detail page {job_url}: {exc}\n")
+        return {
+            "title": None,
+            "location_text": None,
+            "job_description": None,
+            "date_posted": None,
+            "date_posted_text": None,
+        }
+
+    doc = html.fromstring(page_html)
+
+    # Title – <h1 class="section-header ...">
+    title_el = doc.cssselect("h1.section-header")
+    title = clean_text(title_el[0]) if title_el else None
+
+    # Location – <div class="job__location"><div>Location</div></div>
+    loc_el = doc.cssselect("div.job__location div")
+    location_text = clean_text(loc_el[0]) if loc_el else None
+
+    # Description – <div class="job__description body"> … </div>
+    desc_el = doc.cssselect("div.job__description.body")
+    if desc_el:
+        paragraphs = [clean_text(p) for p in desc_el[0].cssselect("p")]
+        job_description = "\n".join(paragraphs) if paragraphs else clean_text(desc_el[0])
+    else:
+        job_description = None
+
+    # Date posted – try generic meta tag or <time> element
+    date_text: Optional[str] = None
+    meta_date = doc.cssselect('meta[name="date"]')
+    if meta_date and meta_date[0].get("content"):
+        date_text = meta_date[0].get("content").strip()
+    else:
+        time_el = doc.cssselect("time")
+        if time_el:
+            date_text = clean_text(time_el[0])
+
+    date_iso: Optional[str] = None
+    if date_text:
+        try:
+            dt = dateparser.parse(date_text)
+            date_iso = dt.isoformat()
+        except Exception:
+            date_iso = None
+
+    return {
+        "title": title,
+        "location_text": location_text,
+        "job_description": job_description,
+        "date_posted": date_iso,
+        "date_posted_text": date_text,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Main scraper logic
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    try:
+        listing_html = fetch(CAREERS_URL)
+    except Exception as exc:
+        sys.stderr.write(f"[ERROR] Unable to fetch listing page: {exc}\n")
+        sys.exit(1)
+
+    doc = html.fromstring(listing_html)
+
+    # Each job entry is an <a> inside a <td class="cell">
+    job_links = doc.cssselect("td.cell > a")
+    results: List[Dict[str, Optional[str]]] = []
+
+    for link in job_links:
+        job_url = link.get("href")
+        if not job_url:
+            continue
+
+        # Title (may be overridden by detail page)
+        title_el = link.cssselect("p.body.body--medium")
+        title = clean_text(title_el[0]) if title_el else None
+
+        # Location string from the listing
+        loc_el = link.cssselect("p.body.body__secondary.body--metadata")
+        location_raw = clean_text(loc_el[0]) if loc_el else ""
+        location_data = parse_location(location_raw)
+
+        # Apply India‑only filter
+        if location_data["country_code"] != "IN":
+            continue
+
+        job_id = extract_job_id(job_url)
+
+        # Fetch detail page for richer fields
+        detail = extract_job_detail(job_url)
+
+        # Prefer detail page values when present
+        final_title = detail["title"] or title
+        final_location_text = detail["location_text"] or location_raw
+        if detail["location_text"]:
+            location_data = parse_location(detail["location_text"])
+
+        record = {
+            "title": final_title,
+            "job_id": job_id,
+            "city": location_data["city"],
+            "state": location_data["state"],
+            "country": location_data["country"],
+            "country_code": location_data["country_code"],
+            "url": job_url,
+            "apply_url": job_url,          # Greenhouse uses the same URL for apply
+            "date_posted": detail["date_posted"],
+            "date_posted_text": detail["date_posted_text"],
+            "job_description": detail["job_description"],
+            "employment_type": None,
+            "work_type": None,
+            "salary_range": None,
+        }
+
+        results.append(record)
+
+    # Emit JSONL
+    for rec in results:
+        json.dump(rec, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
 
 

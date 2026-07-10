@@ -3,7 +3,7 @@
   "status": "success",
   "repair_attempts": 1,
   "total_attempts_used": 1,
-  "tokens_prompt": 7688,
-  "tokens_completion": 5181,
+  "tokens_prompt": 8832,
+  "tokens_completion": 5432,
   "firecrawl_credits_used": 0
 }

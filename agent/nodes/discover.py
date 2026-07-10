@@ -50,7 +50,11 @@ ATS_DOMAIN_MARKERS = (
 )
 
 
-STRONG_SUBDOMAIN_LABELS = ("careers", "career", "jobs", "job", "apply", "job-boards")
+# A careers/jobs signal in the HOST (e.g. `careers.`, `jobs.`,
+# `digitalcareers.`, `recruiting.`) is far stronger than the same keyword only
+# in a marketing path (`www.acme.com/xx-en/careers`). Substring match, so
+# `digitalcareers.infosys.com` counts, not just an exact `careers` label.
+CAREERS_HOST_KEYWORDS = ("career", "job", "recruit", "apply", "hire")
 
 
 def _looks_like_careers_url(url: str, domain: str) -> bool:
@@ -61,19 +65,21 @@ def _looks_like_careers_url(url: str, domain: str) -> bool:
 
 
 def _rank(url: str) -> tuple:
-    """Lower sorts first. A dedicated careers/jobs *subdomain* or a recognized
-    ATS host is a far stronger careers signal than a `/xx-en/` locale path on
-    the marketing `www` host — the latter is usually a regional landing page
-    with no job data. Within a tier, prefer shorter paths/URLs (the listing,
-    not one posting or a deep marketing page). Horizontal ranking, not
-    per-domain logic (CLAUDE.md §2 #2).
+    """Lower sorts first. A recognized ATS host, then a host carrying a
+    careers/jobs keyword (a dedicated careers subdomain), then everything else
+    — a `/xx-en/` locale path on the marketing `www` host is usually a
+    regional landing page with no job data. Within a tier, prefer shorter
+    paths/URLs (the listing, not one posting or a deep marketing page).
+    Horizontal ranking, not per-domain logic (CLAUDE.md §2 #2).
     """
     host = urlparse(url).netloc.lower()
     path = urlparse(url).path
-    first_label = host.split(".")[0]
-    is_ats = any(marker in host for marker in ATS_DOMAIN_MARKERS)
-    is_strong_subdomain = first_label in STRONG_SUBDOMAIN_LABELS
-    tier = 0 if is_ats else 1 if is_strong_subdomain else 2
+    if any(marker in host for marker in ATS_DOMAIN_MARKERS):
+        tier = 0
+    elif any(keyword in host for keyword in CAREERS_HOST_KEYWORDS):
+        tier = 1
+    else:
+        tier = 2
     return (tier, path.count("/"), len(url))
 
 

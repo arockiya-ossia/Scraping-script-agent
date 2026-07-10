@@ -474,6 +474,22 @@ GENERIC_SLUG_WORDS = {
 }
 
 
+# Geo-scope and language-switcher slug words. Unlike GENERIC_SLUG_WORDS these
+# never trigger the "lone structural literal" accept-by-default below (a bare
+# "/EMEA/{id}" or "/global-careers-spanish" is navigation, not a Greenhouse-
+# style "/jobs/{id}" path literal) — they only fail to count toward the
+# non-generic-word bar. Horizontal nav pattern, not per-domain (CLAUDE.md §2 #2).
+NAV_SLUG_WORDS = {
+    "global", "international", "worldwide", "americas", "emea", "apac",
+    "europe", "asia", "africa", "oceania", "regional", "country", "location",
+    "english", "spanish", "portuguese", "french", "german", "italian",
+    "dutch", "chinese", "japanese", "korean", "arabic", "russian", "hindi",
+    "mandarin", "polish", "turkish", "swedish", "danish", "norwegian",
+    "finnish", "czech", "greek", "hungarian", "romanian", "thai",
+    "vietnamese", "indonesian", "malay", "hebrew", "ukrainian",
+}
+
+
 def _looks_like_job_slug(href: str, min_words: int = 3) -> bool:
     """A real job posting's URL slug is almost always a multi-word,
     hyphenated job title ("senior-software-engineer") or a GUID (which also
@@ -506,7 +522,7 @@ def _looks_like_job_slug(href: str, min_words: int = 3) -> bool:
 
     if len(words) < min_words:
         return False
-    non_generic = [w for w in words if w.lower() not in GENERIC_SLUG_WORDS]
+    non_generic = [w for w in words if w.lower() not in GENERIC_SLUG_WORDS and w.lower() not in NAV_SLUG_WORDS]
     return len(non_generic) >= 2
 
 

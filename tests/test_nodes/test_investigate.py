@@ -151,6 +151,22 @@ def test_looks_like_job_slug_rejects_nav_category_urls():
         assert inv._looks_like_job_slug(url) is False, url
 
 
+def test_looks_like_job_slug_rejects_language_and_geo_nav():
+    # The infosys false-success: language-switcher and geo-scope hub links
+    # (".../global-careers-spanish") cleared the old word-count bar and got
+    # scraped as fake "jobs". They must be rejected — pure navigation.
+    nav_urls = [
+        "https://digitalcareers.infosys.com/infosys/global-careers-spanish",
+        "https://digitalcareers.infosys.com/infosys/global-careers-portuguese",
+        "https://digitalcareers.infosys.com/infosys/global-careers-french",
+        "https://acme.com/careers/emea-careers",
+    ]
+    for url in nav_urls:
+        assert inv._looks_like_job_slug(url) is False, url
+    # A real posting that merely mentions a country in its title still passes.
+    assert inv._looks_like_job_slug("https://acme.com/jobs/senior-sdet-germany-12345") is True
+
+
 def test_extract_job_links_excludes_nav_pages_sharing_job_keyword():
     html = (
         '<a href="https://careers.swissre.com/go/Job-List/5272601/">All Jobs</a>'

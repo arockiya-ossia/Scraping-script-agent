@@ -1,5 +1,5 @@
 {
-  "spanish": {
+  "65449000002129032": {
     "title": 1.0,
     "job_id": 1.0,
     "city": 0.0,
@@ -10,12 +10,12 @@
     "apply_url": 1.0,
     "date_posted": 0.0,
     "date_posted_text": 0.0,
-    "job_description": 1.0,
+    "job_description": 0.0,
     "employment_type": 0.0,
     "work_type": 0.0,
     "salary_range": 0.0
   },
-  "portuguese": {
+  "65449000000416161": {
     "title": 1.0,
     "job_id": 1.0,
     "city": 0.0,
@@ -26,23 +26,7 @@
     "apply_url": 1.0,
     "date_posted": 0.0,
     "date_posted_text": 0.0,
-    "job_description": 1.0,
-    "employment_type": 0.0,
-    "work_type": 0.0,
-    "salary_range": 0.0
-  },
-  "french": {
-    "title": 1.0,
-    "job_id": 1.0,
-    "city": 0.0,
-    "state": 0.0,
-    "country": 0.0,
-    "country_code": 0.0,
-    "url": 1.0,
-    "apply_url": 1.0,
-    "date_posted": 0.0,
-    "date_posted_text": 0.0,
-    "job_description": 1.0,
+    "job_description": 0.0,
     "employment_type": 0.0,
     "work_type": 0.0,
     "salary_range": 0.0

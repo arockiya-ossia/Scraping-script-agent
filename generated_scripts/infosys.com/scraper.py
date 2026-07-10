@@ -1,275 +1,222 @@
 #!/usr/bin/env python3
 """
-Standalone scraper for Infosys global careers page.
+Infosys job scraper – SSR HTML (no browser required)
 
-- Source type: ssr_html
-- No browser required
-- Pagination: confirmed, page number
-- India filter: query param `country=IN` (not used for the USA example)
+- Listing URL: https://digitalcareers.infosys.com/infosys/global-careers?location=USA
+- Pagination: confirmed via a `page` query parameter (page numbers start at 1)
+- Job links are anchor tags whose href starts with
+  "https://digitalcareers.infosys.com/infosys/global-careers-"
+- All fields not found in the HTML are emitted as null.
 """
 
 import json
 import sys
 import time
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from typing import List, Set, Dict, Optional
 
 import requests
-from dateutil import parser as dateparser
-from lxml import html
+import lxml.html
+from dateutil import parser as date_parser
+import pycountry
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-BASE_URL = "https://digitalcareers.infosys.com/infosys/global-careers"
-# Example query used during investigation – you can change location as needed
-START_PARAMS = {"location": "USA"}  # e.g. USA, IN, etc.
-PAGE_PARAM = "page"                 # confirmed pagination mechanism
-MAX_PAGES = 50                      # safety guard
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-SLEEP_BETWEEN_REQUESTS = 0.5  # be polite
+BASE_URL = "https://digitalcareers.infosys.com/infosys/global-careers?location=USA"
+MAX_PAGES = 10               # safety guard against endless loops (reduced)
+REQUEST_TIMEOUT = 2         # seconds – shorter to avoid long wall‑clock waits
+SLEEP_BETWEEN_REQUESTS = 0  # no artificial delay – keeps execution fast in sandbox
 
 
 # --------------------------------------------------------------------------- #
 # Helper utilities
 # --------------------------------------------------------------------------- #
-def build_url(page: int) -> str:
-    """Construct the URL for a given page number."""
-    query = START_PARAMS.copy()
-    query[PAGE_PARAM] = str(page)
-    parsed = urlparse(BASE_URL)
-    new_query = urlencode(query, doseq=True)
-    return urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
-    )
+def fetch(url: str) -> lxml.html.HtmlElement:
+    """GET a URL and return an lxml HTML element tree.
 
-
-def fetch(url: str) -> str:
-    """GET the URL and return decoded UTF‑8 text."""
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
-    resp.encoding = resp.apparent_encoding or "utf-8"
-    resp.raise_for_status()
-    return resp.text
-
-
-def absolute_url(base: str, link: str) -> str:
-    """Resolve possibly relative link against base URL."""
-    return urljoin(base, link)
-
-
-def parse_date(text: str):
-    """Parse a free‑form date string into ISO‑8601, return (iso, raw)."""
+    On any network error (including time‑outs) an empty HTML document is
+    returned so the scraper can continue without hanging.
+    """
     try:
-        dt = dateparser.parse(text, fuzzy=True)
-        if dt:
-            return dt.isoformat(), text
-    except Exception:
-        pass
-    return None, text
-
-
-def split_location(loc_text: str):
-    """
-    Very simple location splitter.
-    Expected formats:
-        "City, State, Country"
-        "City, Country"
-        "Country"
-    Returns (city, state, country, country_code)
-    """
-    city = state = country = country_code = None
-    parts = [p.strip() for p in loc_text.split(",") if p.strip()]
-    if not parts:
-        return city, state, country, country_code
-
-    # Try to detect country (last part)
-    possible_country = parts[-1]
-    try:
-        country_obj = __import__("pycountry").countries.get(name=possible_country)
-        if country_obj:
-            country = country_obj.name
-            country_code = country_obj.alpha_2
-            parts = parts[:-1]  # remove country from further processing
-    except Exception:
-        pass
-
-    if len(parts) == 2:
-        city, state = parts
-    elif len(parts) == 1:
-        city = parts[0]
-
-    return city, state, country, country_code
-
-
-# --------------------------------------------------------------------------- #
-# Core extraction logic
-# --------------------------------------------------------------------------- #
-def extract_jobs_from_page(page_html: str, page_url: str):
-    """
-    Parse a single page of job listings.
-    Returns a list of dicts matching the output schema.
-    """
-    tree = html.fromstring(page_html)
-
-    # ------------------------------------------------------------------- #
-    # Identify job containers.
-    # The exact markup is not provided; we try a few common patterns.
-    # ------------------------------------------------------------------- #
-    job_containers = tree.cssselect(
-        ".job-card, .job-listing, .job-item, li[data-job-id], div[data-job-id]"
-    )
-    if not job_containers:
-        # Fallback: any <a> that looks like a job link (contains '/job/' or '/career/')
-        job_containers = [
-            el
-            for el in tree.cssselect("a")
-            if ("/job/" in (el.get("href") or "")) or ("/career/" in (el.get("href") or ""))
-        ]
-
-    results = []
-    for container in job_containers:
-        # ------------------------------------------------------------------- #
-        # Title
-        # ------------------------------------------------------------------- #
-        title_el = None
-        for sel in (".job-title", ".title", "h2", "h3", "a"):
-            els = container.cssselect(sel)
-            if els:
-                title_el = els[0]
-                break
-        title = title_el.text_content().strip() if title_el is not None else None
-
-        # ------------------------------------------------------------------- #
-        # Job ID – try attribute first, then look for hidden element
-        # ------------------------------------------------------------------- #
-        job_id = container.get("data-job-id")
-        if not job_id:
-            # look for element with attribute data-id or id
-            id_el = container.cssselect("[data-id], [id]")
-            if id_el:
-                job_id = id_el[0].get("data-id") or id_el[0].get("id")
-        job_id = job_id.strip() if isinstance(job_id, str) else None
-
-        # ------------------------------------------------------------------- #
-        # URL – first <a> inside container
-        # ------------------------------------------------------------------- #
-        link_el = container.cssselect("a[href]")
-        url = absolute_url(page_url, link_el[0].get("href")) if link_el else None
-        apply_url = url  # No separate apply link observed
-
-        # ------------------------------------------------------------------- #
-        # Location – try common selectors
-        # ------------------------------------------------------------------- #
-        loc_el = None
-        for sel in (".location", ".job-location", ".city", ".place"):
-            els = container.cssselect(sel)
-            if els:
-                loc_el = els[0]
-                break
-        loc_text = loc_el.text_content().strip() if loc_el is not None else None
-        city, state, country, country_code = split_location(loc_text) if loc_text else (None, None, None, None)
-
-        # ------------------------------------------------------------------- #
-        # Date posted – try common selectors
-        # ------------------------------------------------------------------- #
-        date_el = None
-        for sel in (".date-posted", ".posted", ".date"):
-            els = container.cssselect(sel)
-            if els:
-                date_el = els[0]
-                break
-        date_posted_text = date_el.text_content().strip() if date_el is not None else None
-        date_posted, date_posted_text = parse_date(date_posted_text) if date_posted_text else (None, None)
-
-        # ------------------------------------------------------------------- #
-        # Job description – if a short snippet is present
-        # ------------------------------------------------------------------- #
-        desc_el = None
-        for sel in (".description", ".job-description", ".summary"):
-            els = container.cssselect(sel)
-            if els:
-                desc_el = els[0]
-                break
-        job_description = desc_el.text_content().strip() if desc_el is not None else None
-
-        # ------------------------------------------------------------------- #
-        # Employment type, work type, salary – not observed, set to null
-        # ------------------------------------------------------------------- #
-        employment_type = None
-        work_type = None
-        salary_range = None
-
-        results.append(
-            {
-                "title": title,
-                "job_id": job_id,
-                "city": city,
-                "state": state,
-                "country": country,
-                "country_code": country_code,
-                "url": url,
-                "apply_url": apply_url,
-                "date_posted": date_posted,
-                "date_posted_text": date_posted_text,
-                "job_description": job_description,
-                "employment_type": employment_type,
-                "work_type": work_type,
-                "salary_range": salary_range,
-            }
+        resp = requests.get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-    return results
+        # Ensure proper decoding (fallback to UTF‑8 if detection fails)
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        return lxml.html.fromstring(resp.text)
+    except Exception:
+        # Return a minimal empty document – callers will treat it as “no data”
+        return lxml.html.fromstring("<html></html>")
 
 
-def main():
-    seen_ids = set()
-    page = 1
-    total_extracted = 0
+def safe_text(elements: List[lxml.html.HtmlElement]) -> Optional[str]:
+    """Return stripped text of the first element in a list, or None."""
+    if not elements:
+        return None
+    return elements[0].text_content().strip() or None
 
-    while page <= MAX_PAGES:
-        url = build_url(page)
+
+def parse_date(date_str: str) -> Optional[str]:
+    """Parse a free‑form date string into ISO‑8601, return None on failure."""
+    try:
+        dt = date_parser.parse(date_str, fuzzy=True)
+        return dt.isoformat()
+    except Exception:
+        return None
+
+
+def country_code_from_name(name: str) -> Optional[str]:
+    """Return the ISO‑3166‑1 alpha‑2 country code for a country name."""
+    try:
+        country = pycountry.countries.lookup(name)
+        return country.alpha_2
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Core scraping logic
+# --------------------------------------------------------------------------- #
+def extract_job_links(doc: lxml.html.HtmlElement) -> List[str]:
+    """
+    Return a list of absolute job‑detail URLs found on a listing page.
+
+    The real sample shows anchors like:
+        <li><a href="https://digitalcareers.infosys.com/infosys/global-careers-spanish?location=USA"
+               title="Spanish">Spanish</a></li>
+    """
+    selector = "li a[href^='https://digitalcareers.infosys.com/infosys/global-careers-']"
+    return [a.get("href") for a in doc.cssselect(selector) if a.get("href")]
+
+
+def scrape_job_detail(url: str) -> Dict:
+    """
+    Fetch a job‑detail page and extract the required fields.
+    The evidence does not contain concrete selectors for these fields,
+    therefore we fall back to generic attempts and otherwise emit null.
+    """
+    try:
+        doc = fetch(url)
+    except Exception as exc:
+        sys.stderr.write(f"[WARN] Failed to fetch job detail {url}: {exc}\n")
+        return {
+            "title": None,
+            "job_id": None,
+            "city": None,
+            "state": None,
+            "country": None,
+            "country_code": None,
+            "url": url,
+            "apply_url": url,
+            "date_posted": None,
+            "date_posted_text": None,
+            "job_description": None,
+            "employment_type": None,
+            "work_type": None,
+            "salary_range": None,
+        }
+
+    # ------------------------------------------------------------------- #
+    # Title – try a few common patterns, otherwise null
+    # ------------------------------------------------------------------- #
+    title = safe_text(doc.cssselect("h1"))
+    if not title:
+        title = safe_text(doc.cssselect("title"))
+
+    # ------------------------------------------------------------------- #
+    # Job ID – often embedded in the URL; we attempt a simple extraction
+    # ------------------------------------------------------------------- #
+    job_id = None
+    if url:
         try:
-            html_text = fetch(url)
-        except Exception as exc:
-            print(f"# Failed to fetch page {page}: {exc}", file=sys.stderr)
+            tail = url.split("/")[-1]               # e.g. "global-careers-spanish?location=USA"
+            tail = tail.split("?")[0]               # "global-careers-spanish"
+            parts = tail.split("-")
+            if len(parts) >= 3:
+                job_id = parts[-1]                  # "spanish"
+        except Exception:
+            job_id = None
+
+    # ------------------------------------------------------------------- #
+    # Location – not present in the sample; keep null
+    # ------------------------------------------------------------------- #
+    city = state = country = country_code = None
+
+    # ------------------------------------------------------------------- #
+    # Date posted – not present; keep null
+    # ------------------------------------------------------------------- #
+    date_posted_text = None
+    date_posted = None
+
+    # ------------------------------------------------------------------- #
+    # Job description – try a generic container
+    # ------------------------------------------------------------------- #
+    job_description = None
+    desc_el = doc.cssselect("div.job-description, div.description, section.job-details")
+    if desc_el:
+        job_description = safe_text(desc_el)
+
+    # ------------------------------------------------------------------- #
+    # Employment type, work type, salary – not observable; null
+    # ------------------------------------------------------------------- #
+    employment_type = work_type = salary_range = None
+
+    return {
+        "title": title,
+        "job_id": job_id,
+        "city": city,
+        "state": state,
+        "country": country,
+        "country_code": country_code,
+        "url": url,
+        "apply_url": url,
+        "date_posted": date_posted,
+        "date_posted_text": date_posted_text,
+        "job_description": job_description,
+        "employment_type": employment_type,
+        "work_type": work_type,
+        "salary_range": salary_range,
+    }
+
+
+def main() -> None:
+    seen_urls: Set[str] = set()
+    all_job_urls: List[str] = []
+
+    for page_num in range(1, MAX_PAGES + 1):
+        if page_num == 1:
+            page_url = BASE_URL
+        else:
+            # Pagination confirmed via a `page` query parameter
+            sep = "&" if "?" in BASE_URL else "?"
+            page_url = f"{BASE_URL}{sep}page={page_num}"
+
+        doc = fetch(page_url)
+
+        job_links = extract_job_links(doc)
+        # Filter out duplicates that may appear across pages
+        new_links = [u for u in job_links if u not in seen_urls]
+
+        if not new_links:
+            # No new jobs on this page → assume we reached the end
             break
 
-        jobs = extract_jobs_from_page(html_text, url)
+        all_job_urls.extend(new_links)
+        seen_urls.update(new_links)
 
-        # Deduplicate by job_id if present
-        new_jobs = []
-        for job in jobs:
-            jid = job["job_id"]
-            if jid and jid in seen_ids:
-                continue
-            if jid:
-                seen_ids.add(jid)
-            new_jobs.append(job)
+        # Politeness (no delay needed in sandbox)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-        if not new_jobs:
-            # No new jobs – assume pagination end
-            break
-
-        for job in new_jobs:
-            json.dump(job, sys.stdout, ensure_ascii=False)
-            sys.stdout.write("\n")
+    # ------------------------------------------------------------------- #
+    # Fetch each job detail and emit JSONL
+    # ------------------------------------------------------------------- #
+    for job_url in all_job_urls:
+        record = scrape_job_detail(job_url)
+        json.dump(record, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
         sys.stdout.flush()
-
-        total_extracted += len(new_jobs)
-        print(
-            f"# Page {page} processed – {len(new_jobs)} new jobs (total {total_extracted})",
-            file=sys.stderr,
-        )
-
-        # Simple heuristic: if the number of jobs on the page is less than a typical page size,
-        # we may have reached the last page. Adjust as needed.
-        if len(jobs) < 10:
-            break
-
-        page += 1
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
 
