@@ -7,7 +7,6 @@ page, figures out how the job data is actually served, generates a
 validates the output, and self-repairs on failure — unattended. The
 generated scraper runs with **no LLM calls and no browser at runtime**.
 
-Full build spec: [CLAUDE.md](CLAUDE.md).
 
 ## Quick start
 
