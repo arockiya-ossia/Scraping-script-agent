@@ -5,6 +5,33 @@ from agent.nodes import investigate as inv
 from agent.tools.probe_endpoint import ProbeResult
 
 
+def test_try_ssr_pagination_confirms_single_page_when_response_unchanged(monkeypatch):
+    # Lever-style: unrecognized query params are ignored, the full listing
+    # is returned every time — must not be mistaken for a failed probe.
+    base_links = {"https://jobs.lever.co/paytm/job-a", "https://jobs.lever.co/paytm/job-b"}
+
+    def fake_probe(url, method="GET", params=None, json_body=None, headers=None, timeout=20.0):
+        html = "".join(f'<a href="{link}">x</a>' for link in base_links)
+        return ProbeResult(url=url, status=200, json_body=None, text_body=html)
+
+    monkeypatch.setattr(inv, "probe_endpoint", fake_probe)
+    result = inv._try_ssr_pagination("https://jobs.lever.co/paytm", base_links)
+    assert result == {"confirmed": True, "mechanism": "single_page", "param": None}
+
+
+def test_try_ssr_pagination_still_confirms_page_number_when_content_changes(monkeypatch):
+    base_links = {"https://example.com/job-a"}
+
+    def fake_probe(url, method="GET", params=None, json_body=None, headers=None, timeout=20.0):
+        html = '<a href="https://example.com/job-b">x</a>'
+        return ProbeResult(url=url, status=200, json_body=None, text_body=html)
+
+    monkeypatch.setattr(inv, "probe_endpoint", fake_probe)
+    result = inv._try_ssr_pagination("https://example.com/jobs?page=1", base_links)
+    assert result["confirmed"] is True
+    assert result["mechanism"] == "page number"
+
+
 def test_looks_like_job_list_flat():
     payload = {"jobs": [{"id": 1, "title": "Engineer"}, {"id": 2, "title": "Manager"}]}
     result = inv._looks_like_job_list(payload)

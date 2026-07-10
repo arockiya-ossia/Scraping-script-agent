@@ -20,6 +20,7 @@ from agent.llm.codeformat import extract_json
 from agent.models.evidence import SourceType
 from agent.models.network import CapturedRequest, parse_captured_request
 from agent.nodes import traced
+from agent.nodes.discover import _find_ats_link
 from agent.state import AgentState
 from agent.tools.fetch_url import fetch_url
 from agent.tools.probe_endpoint import probe_endpoint
@@ -332,21 +333,31 @@ def _extract_job_links(html_text: str) -> set:
 def _try_ssr_pagination(url: str, base_links: set) -> dict:
     """Empirically test common HTML pagination query params. A page-2 fetch
     that returns a *different* link set confirms multi-page pagination; one
-    that returns an *empty* set confirms all jobs already fit on one page —
-    both are legitimate, empirically-confirmed outcomes.
+    that returns an *empty* set confirms all jobs already fit on one page.
+    A third, equally valid outcome: the same *non-empty, unchanged* set on
+    every param variant — many single-listing ATS pages (e.g. Lever) simply
+    ignore unrecognized query params and always return the full listing,
+    rather than erroring or emptying out.
     """
     if not base_links:
         return {"confirmed": False, "mechanism": None, "param": None}
+    any_success = False
+    always_same = True
     for param in ("page", "p", "pg"):
         try:
             probed = probe_endpoint(_url_with_params(url, {param: 2}))
             probed_links = _extract_job_links(probed.text_body)
         except Exception:
             continue
+        any_success = True
         if probed_links and probed_links != base_links:
             return {"confirmed": True, "mechanism": "page number", "param": param}
         if not probed_links:
             return {"confirmed": True, "mechanism": "single_page", "param": None}
+        if probed_links != base_links:
+            always_same = False
+    if any_success and always_same:
+        return {"confirmed": True, "mechanism": "single_page", "param": None}
     return {"confirmed": False, "mechanism": None, "param": None}
 
 
@@ -540,6 +551,29 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
     else:
         job_links = _extract_job_links(fetch_result.html)
         if job_links:
+            # Playwright executes JavaScript, so fetch_result.html can
+            # contain client-rendered content (e.g. a career-site embed
+            # widget) that the generated scraper — plain `requests`/`httpx`,
+            # no JS engine, per the sandbox's library list — could never
+            # replicate. Only trust SSR_HTML if the same job-shaped links
+            # actually survive a plain, JS-free HTTP fetch of the same URL.
+            try:
+                plain = probe_endpoint(careers_url)
+                plain_links = _extract_job_links(plain.text_body)
+            except Exception:
+                plain_links = set()
+
+            if not (job_links & plain_links):
+                trace_sink.emit(
+                    domain, run_id, type="decision", node="investigate", action="reject_js_rendered_ssr",
+                    rationale=(
+                        f"{len(job_links)} job-shaped link(s) appeared only after JavaScript "
+                        "execution — none survive a plain HTTP fetch of the same URL, so a "
+                        "requests-based scraper could never see them."
+                    ),
+                )
+                return None
+
             trace_sink.emit(
                 domain, run_id, type="tool_call", node="investigate", tool="probe_endpoint",
                 input={"url": careers_url, "purpose": "SSR pagination + india-filter probing"},
@@ -597,6 +631,41 @@ def investigate(state: AgentState) -> AgentState:
 
     findings: dict[str, Any] = {"careers_url": careers_url}
     sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence)
+
+    # discover.py's ATS-link check uses a plain HTTP probe (no JS), so it
+    # misses a link that only renders after JavaScript execution (e.g. a
+    # career-site embed widget) — but investigate.py already has that
+    # JS-rendered HTML in hand via Playwright. Follow up to 2 ATS-link hops
+    # (marketing page -> a specific job posting -> that posting's "back to
+    # all openings" link, which is often shorter/more general than the
+    # first link found) before trying anything more expensive.
+    for _ in range(2):
+        if evidence.is_sufficient():
+            break
+        ats_link = _find_ats_link(fetch_result.html, careers_url)
+        if not ats_link or ats_link == careers_url:
+            break
+        trace_sink.emit(
+            domain, run_id, type="decision", node="investigate", action="follow_ats_link_from_rendered_html",
+            rationale=(
+                f"Found a recognized ATS link ({ats_link}) in the JS-rendered page that "
+                "discover.py's plain-HTTP probe couldn't have seen."
+            ),
+        )
+        careers_url = ats_link
+        evidence.careers_url = ats_link
+        trace_sink.emit(domain, run_id, type="tool_call", node="investigate", tool="fetch_url", input={"url": careers_url})
+        fetch_result = fetch_url(careers_url)
+        ats_artifact = trace_sink.save_artifact(domain, "page_ats.html", fetch_result.html)
+        trace_sink.emit(
+            domain, run_id, type="tool_result", node="investigate", tool="fetch_url",
+            status=fetch_result.status, network_request_count=len(fetch_result.network_requests),
+            artifact_ref=ats_artifact,
+        )
+        findings["careers_url"] = careers_url
+        retried_sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence)
+        if retried_sample_text is not None:
+            sample_text = retried_sample_text
 
     if not evidence.is_sufficient():
         # Passive load didn't produce enough evidence — either nothing

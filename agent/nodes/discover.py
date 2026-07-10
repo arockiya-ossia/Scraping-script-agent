@@ -4,7 +4,7 @@
 """
 
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from lxml import html as lxml_html
 
@@ -40,6 +40,13 @@ ATS_DOMAIN_MARKERS = (
     "ashbyhq.com",
     "jobvite.com",
     "bamboohr.com",
+    "zohorecruit.in",
+    "zohorecruit.com",
+    "freshteam.com",
+    "keka.com",
+    "darwinbox.com",
+    "recruitee.com",
+    "breezy.hr",
 )
 
 
@@ -59,14 +66,33 @@ def _probe(url: str) -> Optional[ProbeResult]:
 
 
 def _find_ats_link(html_text: str, base_url: str) -> Optional[str]:
+    """Returns the shortest matching ATS link (fewest path segments) rather
+    than the first one found — a page can link to several individual job
+    postings on the ATS domain before it links to the listing/search page
+    itself, and the shortest URL is generally the listing, not one job's
+    detail page.
+    """
     try:
         tree = lxml_html.fromstring(html_text)
     except Exception:
         return None
+    candidates = []
     for href in tree.xpath("//a/@href"):
-        if any(marker in href for marker in ATS_DOMAIN_MARKERS):
-            return href if href.startswith("http") else urljoin(base_url, href)
-    return None
+        if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
+        resolved = href if href.startswith(("http://", "https://")) else urljoin(base_url, href)
+        # Match against the resolved URL's actual host — a substring check
+        # against the raw href can false-positive on share/mailto links
+        # whose query string happens to *contain* another URL as text
+        # (e.g. "mailto:?body=...zohorecruit.in...").
+        if not resolved.startswith(("http://", "https://")):
+            continue
+        host = urlparse(resolved).netloc
+        if any(marker in host for marker in ATS_DOMAIN_MARKERS):
+            candidates.append(resolved)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda url: (urlparse(url).path.count("/"), len(url)))
 
 
 @traced
