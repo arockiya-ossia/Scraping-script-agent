@@ -838,7 +838,7 @@ def _classify_pdf_source(url: str, domain: str, run_id: str, findings: dict, evi
     )
 
 
-def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: str, findings: dict, evidence) -> Optional[str]:
+def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: str, findings: dict, evidence, from_firecrawl: bool = False) -> Optional[str]:
     """Attempts REST/GraphQL/SSR classification against one fetch_result.
     Mutates `evidence` and `findings` in place. Returns the sample_text on
     success, or None if nothing job-shaped was found at all — the caller
@@ -1052,6 +1052,12 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
             evidence.pagination_mechanism = pagination["mechanism"]
             evidence.india_filter_mechanism = "client_side_fallback"
             evidence.requires_browser = True
+            # If these links were only reachable via Firecrawl (plain Playwright
+            # was blocked/empty this run), a sandbox Playwright scraper would be
+            # blocked too — the generated scraper must fetch via Firecrawl at
+            # runtime instead.
+            evidence.requires_firecrawl = from_firecrawl
+            findings["spa_rendered_requires_firecrawl"] = from_firecrawl
             findings["spa_rendered_job_link_count"] = len(job_links)
             findings["spa_pagination_status"] = pagination["status"].value
 
@@ -1126,7 +1132,7 @@ def investigate(state: AgentState) -> AgentState:
             artifact_ref=html_artifact,
         )
 
-    sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence)
+    sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence, from_firecrawl=retry_after_forbidden)
 
     # discover.py's ATS-link check uses a plain HTTP probe (no JS), so it
     # misses a link that only renders after JavaScript execution (e.g. a
@@ -1223,7 +1229,7 @@ def investigate(state: AgentState) -> AgentState:
             state["firecrawl_actions_attempted"] = True
             firecrawl_result = _try_firecrawl_actions(careers_url, domain, run_id)
             fetch_result = firecrawl_result
-            firecrawl_sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence)
+            firecrawl_sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence, from_firecrawl=True)
             if firecrawl_sample_text is not None:
                 sample_text = firecrawl_sample_text
 
@@ -1291,6 +1297,7 @@ def _finish_investigation(state: AgentState, evidence, findings: dict, careers_u
         pagination_status=evidence.pagination_status.value if evidence.pagination_status else None,
         pagination_mechanism=evidence.pagination_mechanism,
         requires_browser=evidence.requires_browser,
+        requires_firecrawl=evidence.requires_firecrawl,
         india_filter_mechanism=evidence.india_filter_mechanism,
         reported_total_count=evidence.reported_total_count,
         sufficient=evidence.is_sufficient(),

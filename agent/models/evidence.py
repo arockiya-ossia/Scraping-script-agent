@@ -36,6 +36,10 @@ class InvestigationEvidence(BaseModel):
     pagination_mechanism: Optional[str] = None  # e.g. "offset/limit", "cursor", "page number", "load more"
     india_filter_mechanism: Optional[str] = None  # e.g. "query param country=IN", or "client_side_fallback"
     requires_browser: bool = False  # the generated scraper must render JS (Playwright), not just fetch HTML
+    requires_firecrawl: bool = False  # site edge-blocks plain fetch AND Playwright — only Firecrawl's
+    # stealth rendering reached it during investigation, so the generated scraper must fetch/render via
+    # the Firecrawl API at runtime (Firecrawl is a fetch/render service, not an LLM — the "no LLM calls at
+    # runtime" rule is preserved). Set only when Playwright empirically failed and Firecrawl succeeded.
     reported_total_count: Optional[int] = None  # if the source itself reports a total
     evidence_notes: str = ""  # LLM's reasoning, goes straight into the trace
 

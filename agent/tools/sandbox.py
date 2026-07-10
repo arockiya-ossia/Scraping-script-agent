@@ -54,6 +54,14 @@ def run_script(script_path: Path, output_dir: Path, domain: str) -> SandboxRunRe
         f"https_proxy={proxy_url}",
         "-e",
         "HOME=/tmp",  # writable scratch for Chromium's profile/cache dirs (root fs is read-only)
+    ]
+    # Firecrawl key for sources the generated scraper must render via the
+    # Firecrawl API at runtime (edge-blocked/stealth-only sites). Firecrawl is
+    # a fetch/render service, not an LLM — the "no LLM calls at runtime" rule
+    # is preserved. Only injected when configured.
+    if settings.firecrawl_api_key:
+        cmd += ["-e", f"FIRECRAWL_API_KEY={settings.firecrawl_api_key}"]
+    cmd += [
         "--memory",
         settings.sandbox_memory_limit,
         "--cpus",
