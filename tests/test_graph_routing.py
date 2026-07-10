@@ -47,6 +47,18 @@ def test_route_evidence_budget_exhausted_routes_to_finalize():
     assert _route_evidence(state) == "budget_exhausted"
 
 
+def test_route_evidence_stagnant_routes_to_finalize_even_with_budget_left():
+    # Two consecutive investigate() calls produced byte-identical evidence
+    # — retrying further within the remaining budget is provably pointless.
+    state = _state(evidence=InvestigationEvidence(), total_attempts=5, investigation_stagnant=True)
+    assert _route_evidence(state) == "budget_exhausted"
+
+
+def test_route_evidence_not_stagnant_still_loops_normally():
+    state = _state(evidence=InvestigationEvidence(), total_attempts=5, investigation_stagnant=False)
+    assert _route_evidence(state) == "insufficient"
+
+
 def test_route_validation_pass():
     state = _state(validation_report=ValidationReport(passed=True, row_count=5))
     assert _route_validation(state) == "pass"

@@ -1058,4 +1058,32 @@ def _finish_investigation(state: AgentState, evidence, findings: dict, careers_u
             rationale=f"Recorded learned pattern for site signature {signature}.",
         )
 
+    # Stagnation detection: if evidence is still insufficient AND every
+    # discriminating fact is byte-identical to the *previous* investigate()
+    # call's result, this attempt learned nothing new — evidence_check's
+    # retry loop would otherwise keep re-confirming the same negative
+    # result on every remaining budget slot, spending real LLM tokens for
+    # zero new information (observed live: 7 near-identical calls on one
+    # domain before the budget ran out).
+    fingerprint = "|".join(
+        str(x)
+        for x in (
+            evidence.source_type.value if evidence.source_type else None,
+            careers_url,
+            evidence.pagination_param_confirmed,
+            evidence.pagination_mechanism,
+            evidence.india_filter_mechanism,
+            evidence.reported_total_count,
+        )
+    )
+    if not evidence.is_sufficient() and fingerprint == state.get("investigation_fingerprint"):
+        state["investigation_stagnant"] = True
+        trace_sink.emit(
+            domain, run_id, type="decision", node="investigate", action="detected_stagnation",
+            rationale="This attempt produced the exact same evidence as the previous one — no new information to gain from retrying further.",
+        )
+    else:
+        state["investigation_stagnant"] = False
+    state["investigation_fingerprint"] = fingerprint
+
     return state

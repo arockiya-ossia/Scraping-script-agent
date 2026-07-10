@@ -160,55 +160,76 @@ def fetch_url(
     captured: list[dict[str, Any]] = []
     interactions: list[dict[str, Any]] = []
     started = time.monotonic()
+    html = ""
+    status = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page()
+        try:
+            page = browser.new_page()
 
-        if capture_network:
-            def on_response(response):
-                req = response.request
-                if req.resource_type in ("xhr", "fetch"):
-                    try:
-                        body = response.text()
-                    except Exception:
-                        body = None
-                    try:
-                        request_headers = dict(req.headers)
-                    except Exception:
-                        request_headers = {}
-                    try:
-                        request_body = req.post_data
-                    except Exception:
-                        request_body = None
-                    try:
-                        response_content_type = response.headers.get("content-type")
-                    except Exception:
-                        response_content_type = None
-                    captured.append(
-                        {
-                            "url": response.url,
-                            "method": req.method,
-                            "status": response.status,
-                            "body": body,  # response body — kept for backward compat
-                            "request_headers": request_headers,
-                            "request_body": request_body,
-                            "response_content_type": response_content_type,
-                        }
-                    )
+            if capture_network:
+                def on_response(response):
+                    req = response.request
+                    if req.resource_type in ("xhr", "fetch"):
+                        try:
+                            body = response.text()
+                        except Exception:
+                            body = None
+                        try:
+                            request_headers = dict(req.headers)
+                        except Exception:
+                            request_headers = {}
+                        try:
+                            request_body = req.post_data
+                        except Exception:
+                            request_body = None
+                        try:
+                            response_content_type = response.headers.get("content-type")
+                        except Exception:
+                            response_content_type = None
+                        captured.append(
+                            {
+                                "url": response.url,
+                                "method": req.method,
+                                "status": response.status,
+                                "body": body,  # response body — kept for backward compat
+                                "request_headers": request_headers,
+                                "request_body": request_body,
+                                "response_content_type": response_content_type,
+                            }
+                        )
 
-            page.on("response", on_response)
+                page.on("response", on_response)
 
-        response = page.goto(url, wait_until="networkidle", timeout=int(max_page_time * 1000))
-        page.wait_for_timeout(wait_ms)
+            # A navigation failure (timeout, DNS error, connection refused,
+            # aborted by the target) must degrade to an honest empty-ish
+            # result — not raise. Without this, a single slow/unresponsive
+            # domain crashes the entire graph run (an unhandled exception
+            # here propagates straight through investigate() and the
+            # @traced decorator), directly contradicting the system's own
+            # "honest failure, never a crash" design goal. Demonstrated
+            # live: a real domain hit exactly this — `Page.goto: Timeout
+            # 30000ms exceeded` — with no calling code prepared for it.
+            try:
+                response = page.goto(url, wait_until="networkidle", timeout=int(max_page_time * 1000))
+                status = response.status if response else 0
+                page.wait_for_timeout(wait_ms)
 
-        if interact:
-            budget = _Budget(max_interactions, max_scrolls, max_page_time, started)
-            interactions = _run_interactions(page, budget)
+                if interact:
+                    budget = _Budget(max_interactions, max_scrolls, max_page_time, started)
+                    interactions = _run_interactions(page, budget)
+            except Exception:
+                status = 0
 
-        html = page.content()
-        status = response.status if response else 0
-
-        browser.close()
+            try:
+                html = page.content()
+            except Exception:
+                html = ""
+        finally:
+            # Always close the browser, even if navigation/interaction
+            # raised above — otherwise a hung Chromium process leaks for
+            # every failed fetch, not just successful ones.
+            browser.close()
 
     return FetchResult(url=url, status=status, html=html, network_requests=captured, interactions=interactions)

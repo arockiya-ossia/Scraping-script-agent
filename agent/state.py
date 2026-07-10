@@ -44,3 +44,14 @@ class AgentState(TypedDict):
     # on the exact same URL every single attempt even though the page
     # structure hasn't changed and never will within one run.
     firecrawl_actions_attempted: bool
+
+    # A fingerprint of evidence's key discriminating fields after the last
+    # investigate() call, and whether the CURRENT call produced the exact
+    # same fingerprint as the one before it (i.e. genuinely zero new
+    # information — same source_type, same URL, same confirmed-ness).
+    # Without this, a domain whose investigation is provably a dead end
+    # (e.g. Firecrawl already exhausted, page structure unchanged) still
+    # burns the entire attempt budget re-confirming the identical negative
+    # result on every retry — real LLM tokens spent for zero new evidence.
+    investigation_fingerprint: Optional[str]
+    investigation_stagnant: bool

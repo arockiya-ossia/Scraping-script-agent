@@ -25,6 +25,12 @@ def _route_evidence(state: AgentState) -> str:
         return "sufficient"
     if state["total_attempts"] <= 0:
         return "budget_exhausted"
+    if state.get("investigation_stagnant"):
+        # Two consecutive investigate() calls produced byte-identical
+        # evidence — further retries within this budget are provably
+        # pointless. Stop early rather than burn the rest of the attempt
+        # budget re-confirming the same negative result.
+        return "budget_exhausted"
     return "insufficient"
 
 

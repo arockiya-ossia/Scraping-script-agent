@@ -43,6 +43,8 @@ def run(domain: str) -> AgentState:
         "script_revision": 0,
         "run_id": str(int(time.time())),
         "firecrawl_actions_attempted": False,
+        "investigation_fingerprint": None,
+        "investigation_stagnant": False,
     }
     final_state = graph.invoke(initial_state, {"recursion_limit": 200})
     return final_state
