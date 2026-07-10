@@ -1,4 +1,4 @@
-from agent.nodes.discover import _find_ats_link
+from agent.nodes.discover import _find_ats_link, _is_strong_careers_url, _rank
 
 
 def test_ignores_unrendered_template_placeholder_hrefs():
@@ -36,3 +36,21 @@ def test_ignores_mailto_and_javascript_links():
     )
     result = _find_ats_link(html, "https://f22labs.com/careers")
     assert result == "https://f22labs.zohorecruit.in/jobs/Careers"
+
+
+def test_careers_subdomain_outranks_marketing_locale_path():
+    # The cognizant bug: a careers subdomain (bot-blocks httpx) must outrank a
+    # www marketing locale page that merely returns 200, so investigate's
+    # Playwright fetch gets a shot at the real ATS.
+    careers_sub = "https://careers.cognizant.com/us-en/"
+    marketing = "https://www.cognizant.com/au/en/cognizant-careers"
+    assert _rank(careers_sub) < _rank(marketing)
+    ranked = sorted([marketing, careers_sub], key=_rank)
+    assert ranked[0] == careers_sub
+
+
+def test_is_strong_careers_url_recognizes_subdomain_and_ats():
+    assert _is_strong_careers_url("https://careers.example.com/")
+    assert _is_strong_careers_url("https://jobs.example.com/all")
+    assert _is_strong_careers_url("https://boards.greenhouse.io/example")
+    assert not _is_strong_careers_url("https://www.example.com/us-en/careers")

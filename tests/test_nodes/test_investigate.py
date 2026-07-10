@@ -187,6 +187,24 @@ def test_looks_like_job_list_returns_none_for_non_job_data():
     assert inv._looks_like_job_list({"facets": {"shifttype": [{"name": "x", "count": 1}]}}) is None
 
 
+def test_extract_candidate_api_urls_finds_job_endpoints_and_skips_noise():
+    js = """
+    const base = "/api/jobs/search?country=IN";
+    fetch("https://careers.acme.com/services/recruiting/requisitions");
+    import x from "/static/vendor.js";
+    track("https://www.google-analytics.com/collect?job=1");
+    logo("/assets/logo.png");
+    const gql = "https://api.acme.com/graphql";
+    """
+    urls = inv._extract_candidate_api_urls(js, "https://careers.acme.com/en/")
+    assert "https://careers.acme.com/api/jobs/search?country=IN" in urls
+    assert "https://careers.acme.com/services/recruiting/requisitions" in urls
+    assert "https://api.acme.com/graphql" in urls
+    # static asset (.js/.png) and tracking host filtered out
+    assert not any(u.endswith(".js") or u.endswith(".png") for u in urls)
+    assert not any("google-analytics" in u for u in urls)
+
+
 def test_find_json_api_candidates_skips_tracking_and_consent_hosts():
     # A cookie-consent config (OneTrust CDN) and an Adobe id-sync payload both
     # carry title/description-keyed arrays that trip the job-shape heuristic.

@@ -9,6 +9,7 @@ diff, never from the LLM's say-so (CLAUDE.md §6.2).
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
@@ -146,6 +147,118 @@ def _find_json_api_candidates(network_requests: list[dict]) -> list[dict]:
         jobs = _looks_like_job_list(captured.response_json)
         if jobs:
             found.append({"captured": captured, "job_count": len(jobs), "sample": jobs[0]})
+    return found
+
+
+# A URL string extracted from a JS bundle is worth probing as a possible job
+# API only if it carries one of these path/keyword markers. Horizontal, not
+# per-domain logic (CLAUDE.md §2 #2).
+JOB_API_URL_MARKERS = (
+    "job", "jobs", "search", "requisition", "opening",
+    "position", "vacanc", "posting", "career", "graphql",
+)
+
+_STATIC_ASSET_SUFFIXES = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".ico", ".map")
+
+# Absolute (//host/... or https://...) or root-relative (/path) URL literals.
+_JS_URL_RE = re.compile(r"""["'`]((?:https?:)?//[^"'`\s]+|/[A-Za-z0-9._~/%+?&=-]+)["'`]""")
+
+
+def _extract_candidate_api_urls(text: str, base_url: str) -> list[str]:
+    """Scan a blob of JS/HTML for URL literals that look like a job/search API
+    endpoint (absolute or root-relative). Returns absolute URLs, denylisted
+    tracking hosts and static assets removed.
+    """
+    out: list[str] = []
+    for match in _JS_URL_RE.finditer(text):
+        raw = match.group(1)
+        low = raw.lower()
+        if not any(marker in low for marker in JOB_API_URL_MARKERS):
+            continue
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        absolute = raw if raw.startswith("http") else urljoin(base_url, raw)
+        parsed = urlparse(absolute)
+        if not parsed.netloc:
+            continue
+        if any(marker in parsed.netloc for marker in NON_JOB_API_HOST_MARKERS):
+            continue
+        if parsed.path.lower().endswith(_STATIC_ASSET_SUFFIXES):
+            continue
+        out.append(absolute)
+    return out
+
+
+def _find_api_from_js_bundles(fetch_result, careers_url: str, domain: str, run_id: str, max_bundles: int = 12, max_probe: int = 15) -> list[dict]:
+    """When passive network capture surfaced no JSON job API, the endpoint is
+    often still referenced as a string literal inside the page's JS bundles (a
+    fetch/axios call assembled at runtime, never fired on passive load). Scan
+    the inline scripts + same-registrable-domain <script src> bundles for
+    job-API-shaped URL literals, GET-probe each, and return job-shaped hits in
+    the same shape as _find_json_api_candidates. Bounded (bundle + probe caps)
+    so a heavy site can't blow the investigation budget.
+    """
+    html_text = fetch_result.html or ""
+    try:
+        tree = lxml_html.fromstring(html_text)
+    except Exception:
+        tree = None
+
+    base_host = urlparse(careers_url).netloc.lower()
+    registrable = ".".join(base_host.split(".")[-2:]) if base_host else ""
+
+    candidate_urls = list(_extract_candidate_api_urls(html_text, careers_url))
+
+    bundle_urls: list[str] = []
+    if tree is not None:
+        for src in tree.xpath("//script/@src"):
+            if not src:
+                continue
+            absolute = src if src.startswith("http") else urljoin(careers_url, src)
+            host = urlparse(absolute).netloc.lower()
+            if not host or any(m in host for m in NON_JOB_API_HOST_MARKERS):
+                continue
+            if registrable and registrable not in host:
+                continue  # only fetch same-company bundles, not third-party CDNs
+            bundle_urls.append(absolute)
+    for req in fetch_result.network_requests:
+        url = req.get("url", "")
+        if url.lower().split("?")[0].endswith(".js") and registrable and registrable in urlparse(url).netloc.lower():
+            bundle_urls.append(url)
+
+    scanned = 0
+    for bundle in dict.fromkeys(bundle_urls):
+        if scanned >= max_bundles:
+            break
+        scanned += 1
+        try:
+            resp = probe_endpoint(bundle, timeout=10.0)
+        except Exception:
+            continue
+        candidate_urls.extend(_extract_candidate_api_urls(resp.text_body or "", careers_url))
+
+    # Dedupe; probe keyword-richer URLs first; cap total probes.
+    uniq = list(dict.fromkeys(candidate_urls))
+    uniq.sort(key=lambda u: -sum(marker in u.lower() for marker in JOB_API_URL_MARKERS))
+
+    found: list[dict] = []
+    for url in uniq[:max_probe]:
+        try:
+            resp = probe_endpoint(url, timeout=15.0)
+        except Exception:
+            continue
+        if resp.status >= 400 or resp.json_body is None:
+            continue
+        jobs = _looks_like_job_list(resp.json_body)
+        if jobs:
+            captured = parse_captured_request({"url": url, "method": "GET", "status": resp.status, "body": resp.text_body})
+            found.append({"captured": captured, "job_count": len(jobs), "sample": jobs[0]})
+
+    if scanned or found:
+        trace_sink.emit(
+            domain, run_id, type="tool_result", node="investigate", tool="js_bundle_scan",
+            bundles_scanned=scanned, url_candidates=len(uniq), job_apis_found=len(found),
+        )
     return found
 
 
@@ -718,6 +831,25 @@ def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: st
     """
     api_candidates = _find_json_api_candidates(fetch_result.network_requests)
     findings["html_length"] = len(fetch_result.html)
+
+    # No API fired on passive load — the endpoint may still be a string
+    # literal inside the page's JS bundles (assembled and called at runtime).
+    # Scan the bundles and probe extracted URLs before falling back to
+    # link-scraping or a browser-rendered plan (CLAUDE.md §2 #1: still
+    # empirically confirmed via probe_endpoint, never trusted from the text).
+    if not api_candidates:
+        js_candidates = _find_api_from_js_bundles(fetch_result, careers_url, domain, run_id)
+        if js_candidates:
+            api_candidates = js_candidates
+            findings["api_discovered_via"] = "js_bundle"
+            trace_sink.emit(
+                domain, run_id, type="decision", node="investigate", action="found_api_in_js_bundle",
+                rationale=(
+                    f"No API fired on passive load, but a job-shaped JSON endpoint "
+                    f"({js_candidates[0]['captured'].url}) was found referenced in the page's "
+                    "JS bundles and confirmed by a live probe."
+                ),
+            )
 
     # Pick the single best candidate by job count *across* GET and POST/
     # GraphQL together — a GET request that happens to return one or two

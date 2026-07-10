@@ -50,11 +50,35 @@ ATS_DOMAIN_MARKERS = (
 )
 
 
+STRONG_SUBDOMAIN_LABELS = ("careers", "career", "jobs", "job", "apply", "job-boards")
+
+
 def _looks_like_careers_url(url: str, domain: str) -> bool:
     if domain not in url:
         return False
     lowered = url.lower()
     return "career" in lowered or "job" in lowered
+
+
+def _rank(url: str) -> tuple:
+    """Lower sorts first. A dedicated careers/jobs *subdomain* or a recognized
+    ATS host is a far stronger careers signal than a `/xx-en/` locale path on
+    the marketing `www` host — the latter is usually a regional landing page
+    with no job data. Within a tier, prefer shorter paths/URLs (the listing,
+    not one posting or a deep marketing page). Horizontal ranking, not
+    per-domain logic (CLAUDE.md §2 #2).
+    """
+    host = urlparse(url).netloc.lower()
+    path = urlparse(url).path
+    first_label = host.split(".")[0]
+    is_ats = any(marker in host for marker in ATS_DOMAIN_MARKERS)
+    is_strong_subdomain = first_label in STRONG_SUBDOMAIN_LABELS
+    tier = 0 if is_ats else 1 if is_strong_subdomain else 2
+    return (tier, path.count("/"), len(url))
+
+
+def _is_strong_careers_url(url: str) -> bool:
+    return _rank(url)[0] < 2
 
 
 def _probe(url: str) -> Optional[ProbeResult]:
@@ -127,31 +151,59 @@ def discover(state: AgentState) -> AgentState:
 
     candidates.extend(f"https://{domain}{path}" for path in COMMON_PATHS)
 
-    chosen = None
+    # Rank strongest-signal first, dedupe preserving order.
+    seen: set[str] = set()
+    ranked = [u for u in sorted(dict.fromkeys(candidates), key=_rank) if not (u in seen or seen.add(u))]
+
+    first_ok = None  # first candidate whose httpx probe succeeded
+    top_strong = next((u for u in ranked if _is_strong_careers_url(u)), None)
     ats_link_found = None
-    for url in candidates:
+
+    # Probe in ranked order (cap 8) — mainly to harvest an ATS link from a
+    # marketing page's HTML. We do NOT gate selection on probe success: a
+    # careers/jobs subdomain often 403s a plain httpx probe but renders fine
+    # in investigate's Playwright fetch, so a strong candidate is chosen even
+    # when its probe fails, rather than falling back to a marketing page that
+    # merely happened to return 200.
+    for url in ranked[:8]:
         trace_sink.emit(domain, run_id, type="tool_call", node="discover", tool="probe_endpoint", input={"url": url})
         result = _probe(url)
         if result is None:
             trace_sink.emit(domain, run_id, type="tool_result", node="discover", tool="probe_endpoint", status=None)
             continue
         trace_sink.emit(domain, run_id, type="tool_result", node="discover", tool="probe_endpoint", status=result.status)
-        chosen = url
+        if first_ok is None:
+            first_ok = url
         ats_link = _find_ats_link(result.text_body, url)
         if ats_link:
-            chosen = ats_link
             ats_link_found = ats_link
-        break
+            break
+        # A successful probe on the top-ranked strong candidate is good enough
+        # — no need to keep probing weaker marketing paths for an ATS link.
+        if url == top_strong:
+            break
 
-    evidence.careers_url = chosen or (candidates[0] if candidates else f"https://{domain}")
+    if ats_link_found:
+        chosen, action = ats_link_found, "follow_ats_link"
+        rationale = f"Careers page linked out to a recognized ATS domain ({ats_link_found})."
+    elif top_strong:
+        chosen, action = top_strong, "prefer_strong_careers_url"
+        rationale = (
+            f"Chose the strongest careers signal ({top_strong}) — a careers/jobs subdomain "
+            "or ATS host — over any marketing page, even if its plain HTTP probe failed "
+            "(investigate's Playwright fetch handles bot-blocked subdomains)."
+        )
+    elif first_ok:
+        chosen, action = first_ok, "use_probed_candidate"
+        rationale = f"No strong careers subdomain found; first candidate that responded: {first_ok}."
+    else:
+        chosen = ranked[0] if ranked else f"https://{domain}"
+        action = "use_probed_candidate"
+        rationale = f"No candidate responded; handing best-ranked guess to investigate: {chosen}."
+
+    evidence.careers_url = chosen
     trace_sink.emit(
         domain, run_id, type="decision", node="discover",
-        action="follow_ats_link" if ats_link_found else "use_probed_candidate",
-        rationale=(
-            f"Careers page linked out to a recognized ATS domain ({ats_link_found})."
-            if ats_link_found
-            else f"First candidate that responded successfully: {evidence.careers_url}."
-        ),
-        chosen_url=evidence.careers_url,
+        action=action, rationale=rationale, chosen_url=evidence.careers_url,
     )
     return state
