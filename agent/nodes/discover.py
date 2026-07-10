@@ -80,6 +80,14 @@ def _find_ats_link(html_text: str, base_url: str) -> Optional[str]:
     for href in tree.xpath("//a/@href"):
         if not href or href.startswith(("mailto:", "tel:", "javascript:", "#")):
             continue
+        # Client-side templating widgets (Handlebars/Angular/Vue/etc.) that
+        # error out or haven't finished hydrating can leave literal
+        # unrendered placeholders in href attributes, e.g.
+        # "/jobs/{{cxPropShortenUrl}}" — never a real, navigable URL, and
+        # dangerously *short*, so the "prefer shortest URL" rule below would
+        # otherwise pick it over every real candidate.
+        if any(marker in href for marker in ("{{", "}}", "${", "<%", "%>")):
+            continue
         resolved = href if href.startswith(("http://", "https://")) else urljoin(base_url, href)
         # Match against the resolved URL's actual host — a substring check
         # against the raw href can false-positive on share/mailto links

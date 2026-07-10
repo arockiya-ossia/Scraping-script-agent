@@ -36,3 +36,11 @@ class AgentState(TypedDict):
     script_revision: int
 
     run_id: str  # trace file discriminator: traces/{domain}_{run_id}.jsonl
+
+    # Set once investigate.py has tried the Firecrawl-Actions escalation for
+    # this run, regardless of outcome — evidence_check's insufficient-
+    # evidence loop re-invokes investigate() from scratch on every retry,
+    # and without this flag it would re-burn a real, paid Firecrawl credit
+    # on the exact same URL every single attempt even though the page
+    # structure hasn't changed and never will within one run.
+    firecrawl_actions_attempted: bool

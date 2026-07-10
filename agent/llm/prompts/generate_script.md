@@ -26,7 +26,11 @@ evidence above.
   `python scraper.py > output.jsonl` with no dependency on this agent process
   and **no LLM calls at runtime**.
 - Only these libraries are available in the sandbox: `requests`/`httpx`,
-  `lxml`, `cssselect`, `jmespath`, `python-dateutil`, `pydantic`.
+  `lxml`, `cssselect`, `jmespath`, `python-dateutil`, `pydantic`, `pycountry`,
+  `pypdf` (only if the evidence explicitly says the source is a PDF — fetch
+  the PDF URL directly with `requests`/`httpx` and parse it with
+  `pypdf.PdfReader`; never call any external scraping/parsing API from the
+  generated script itself).
 - **Never use `re` or regex** for field extraction. Use CSS selectors
   (`lxml`/`cssselect`) or JSON paths (`jmespath`) only.
 - Prefer server-side India filtering (the confirmed query param) over

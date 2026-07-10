@@ -14,6 +14,7 @@ class ProbeResult:
     status: int
     json_body: Optional[Any]
     text_body: str
+    content_type: Optional[str] = None
 
 
 def probe_endpoint(
@@ -38,4 +39,10 @@ def probe_endpoint(
     except ValueError:
         parsed = None
 
-    return ProbeResult(url=str(resp.url), status=resp.status_code, json_body=parsed, text_body=resp.text)
+    return ProbeResult(
+        url=str(resp.url),
+        status=resp.status_code,
+        json_body=parsed,
+        text_body=resp.text,
+        content_type=resp.headers.get("content-type"),
+    )

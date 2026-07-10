@@ -19,10 +19,12 @@ from agent.llm.client import llm_client
 from agent.llm.codeformat import extract_json
 from agent.models.evidence import SourceType
 from agent.models.network import CapturedRequest, parse_captured_request
+from agent.models.validation import FailureCategory
 from agent.nodes import traced
-from agent.nodes.discover import _find_ats_link
+from agent.nodes.discover import ATS_DOMAIN_MARKERS, _find_ats_link
 from agent.state import AgentState
 from agent.tools.fetch_url import fetch_url
+from agent.tools.firecrawl_client import get_firecrawl_client
 from agent.tools.probe_endpoint import probe_endpoint
 from agent.trace.sink import trace_sink
 from config import settings
@@ -317,17 +319,70 @@ def _try_json_body_india_filter(captured: CapturedRequest) -> Optional[str]:
 JOB_LINK_MARKERS = ("job", "career", "position", "requisition", "opening", "vacancy")
 
 
+# Generic navigational/site-furniture words that show up in category and
+# hub-page slugs ("UK-Career-Site", "Job-List") as often as in real job
+# titles' surrounding text — a slug built almost entirely out of these
+# isn't a job title even if it clears the word-count bar.
+GENERIC_SLUG_WORDS = {
+    "site", "career", "careers", "job", "jobs", "search", "list", "home",
+    "about", "contact", "apply", "index", "hub", "portal", "center", "centre",
+    "landing", "page", "overview", "programme", "program", "starters", "all",
+}
+
+
+def _looks_like_job_slug(href: str, min_words: int = 3) -> bool:
+    """A real job posting's URL slug is almost always a multi-word,
+    hyphenated job title ("senior-software-engineer") or a GUID (which also
+    splits into several hyphen-separated segments) — unlike a navigation/
+    category link's short slug ("emea", "search-jobs", "graduates"). Sites
+    that reuse the same URL pattern for both job postings and category
+    pages (e.g. Swiss Re's "/go/{slug}/{id}/") can't be told apart by
+    keyword or word-count alone: "UK-Career-Site" is 3 words but still not
+    a job title, since two of those words are generic site furniture — a
+    real job title has at least 2 specific, non-generic words.
+    """
+    path = urlparse(href).path.rstrip("/")
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        return False
+    # the ID is often its own trailing numeric segment — look at the slug
+    # segment before it, not the bare number.
+    slug = segments[-2] if segments[-1].isdigit() and len(segments) >= 2 else segments[-1]
+    words = [w for w in slug.replace("_", "-").split("-") if w]
+
+    # Some platforms (Greenhouse: "/{company}/jobs/{id}") don't encode a
+    # descriptive title in the URL at all — the segment before the ID is
+    # just the fixed, generic path literal "jobs", identical on every
+    # posting. There's no distinguishing text to judge there, so a lone
+    # generic word is accepted by default rather than rejected — unlike
+    # Swiss Re's "/go/{slug}/{id}/", where that segment actually varies per
+    # link and is what encodes real vs. navigational content.
+    if len(words) == 1 and words[0].lower() in GENERIC_SLUG_WORDS:
+        return True
+
+    if len(words) < min_words:
+        return False
+    non_generic = [w for w in words if w.lower() not in GENERIC_SLUG_WORDS]
+    return len(non_generic) >= 2
+
+
 def _extract_job_links(html_text: str) -> set:
     """Generic heuristic for SSR job-listing pages: anchors whose href looks
     job-posting-shaped. Not a per-domain selector — the same marker list
-    applies to any site (CLAUDE.md §2 #2 allows horizontal patterns).
+    and slug-shape rule apply to any site (CLAUDE.md §2 #2 allows
+    horizontal patterns). Requires BOTH a marker keyword match AND a
+    job-title-shaped slug — the marker alone lets navigation/category pages
+    through when their own slug happens to contain a job-related word.
     """
     try:
         tree = lxml_html.fromstring(html_text)
     except Exception:
         return set()
     hrefs = tree.xpath("//a/@href")
-    return {h for h in hrefs if any(marker in h.lower() for marker in JOB_LINK_MARKERS)}
+    return {
+        h for h in hrefs
+        if any(marker in h.lower() for marker in JOB_LINK_MARKERS) and _looks_like_job_slug(h)
+    }
 
 
 def _try_ssr_pagination(url: str, base_links: set) -> dict:
@@ -411,7 +466,11 @@ def _sample_job_link_html(html_text: str, max_items: int = 5, max_chars: int = 6
     except Exception:
         return html_text[:max_chars]
     anchors = tree.xpath("//a[@href]")
-    matched = [a for a in anchors if any(marker in (a.get("href") or "").lower() for marker in JOB_LINK_MARKERS)]
+    matched = [
+        a for a in anchors
+        if any(marker in (a.get("href") or "").lower() for marker in JOB_LINK_MARKERS)
+        and _looks_like_job_slug(a.get("href") or "")
+    ]
     snippets = []
     for a in matched[:max_items]:
         container = a.getparent() if a.getparent() is not None else a
@@ -441,6 +500,113 @@ def _write_evidence_sample(domain: str, sample_text: str) -> str:
     sample_path = artifacts_dir / "evidence_sample.txt"
     sample_path.write_text(sample_text or "(no concrete sample captured)", encoding="utf-8")
     return str(sample_path)
+
+
+def _fetch_via_firecrawl(url: str, domain: str, run_id: str):
+    """Escalation fetch — Playwright already failed (HTTP_FORBIDDEN) or is
+    about to be given up on (zero DOM nodes after bounded interactions).
+    Returns a fetch_url.FetchResult-shaped object so _classify_candidates
+    can use it uniformly; network_requests is empty since Firecrawl doesn't
+    expose XHR capture — this path degrades to SSR/link classification.
+    """
+    from agent.tools.fetch_url import FetchResult
+
+    trace_sink.emit(domain, run_id, type="tool_call", node="investigate", tool="firecrawl.scrape", input={"url": url})
+    try:
+        client = get_firecrawl_client()
+        result = client.scrape(url, formats=["html", "links"])
+    except Exception as exc:
+        trace_sink.emit(domain, run_id, type="tool_result", node="investigate", tool="firecrawl.scrape", error=str(exc))
+        return FetchResult(url=url, status=0, html="", network_requests=[])
+
+    artifact = trace_sink.save_artifact(domain, "page_firecrawl.html", result.html or "")
+    trace_sink.emit(
+        domain, run_id, type="tool_result", node="investigate", tool="firecrawl.scrape",
+        success=result.success, status=result.status_code, credits_used=result.credits_used,
+        artifact_ref=artifact,
+    )
+    status = result.status_code or (200 if result.success else 0)
+    return FetchResult(url=url, status=status, html=result.html or "", network_requests=[])
+
+
+def _try_firecrawl_actions(url: str, domain: str, run_id: str):
+    """One richer-interaction attempt via Firecrawl Actions after
+    fetch_url's bounded Playwright interactions still found zero job DOM
+    nodes — a longer, more deliberate click/scroll sequence than the
+    generic budget-capped Playwright pass allows.
+    """
+    from agent.tools.fetch_url import FetchResult
+
+    actions = [
+        {"type": "wait", "milliseconds": 2000},
+        {"type": "click", "selector": "button, a"},
+        {"type": "wait", "milliseconds": 1500},
+        {"type": "scroll", "direction": "down"},
+        {"type": "wait", "milliseconds": 1000},
+        {"type": "scroll", "direction": "down"},
+        {"type": "wait", "milliseconds": 1000},
+    ]
+    trace_sink.emit(
+        domain, run_id, type="tool_call", node="investigate", tool="firecrawl.scrape",
+        input={"url": url, "actions": actions, "purpose": "zero-DOM-nodes escalation"},
+    )
+    try:
+        client = get_firecrawl_client()
+        result = client.scrape(url, formats=["html", "links"], actions=actions)
+    except Exception as exc:
+        trace_sink.emit(domain, run_id, type="tool_result", node="investigate", tool="firecrawl.scrape", error=str(exc))
+        return FetchResult(url=url, status=0, html="", network_requests=[])
+
+    artifact = trace_sink.save_artifact(domain, "page_firecrawl_actions.html", result.html or "")
+    trace_sink.emit(
+        domain, run_id, type="tool_result", node="investigate", tool="firecrawl.scrape",
+        success=result.success, status=result.status_code, credits_used=result.credits_used,
+        artifact_ref=artifact,
+    )
+    status = result.status_code or (200 if result.success else 0)
+    return FetchResult(url=url, status=status, html=result.html or "", network_requests=[])
+
+
+def _classify_pdf_source(url: str, domain: str, run_id: str, findings: dict, evidence) -> Optional[str]:
+    """The careers URL is a PDF — route to Firecrawl's native PDF parsing
+    rather than failing outright. A PDF is structurally a single static
+    document (not a paginated listing), so `pagination_mechanism=single_page`
+    here is a deterministic fact about what a PDF *is*, not a guess —
+    `pagination_param_confirmed` still only ever reflects something actually
+    established, never invented (CLAUDE.md §6.2).
+    """
+    trace_sink.emit(
+        domain, run_id, type="tool_call", node="investigate", tool="firecrawl.scrape",
+        input={"url": url, "purpose": "PDF parsing"},
+    )
+    try:
+        client = get_firecrawl_client()
+        result = client.scrape(url, formats=["markdown"])
+    except Exception as exc:
+        trace_sink.emit(domain, run_id, type="tool_result", node="investigate", tool="firecrawl.scrape", error=str(exc))
+        return None
+
+    artifact = trace_sink.save_artifact(domain, "pdf_extracted.md", result.markdown or "")
+    trace_sink.emit(
+        domain, run_id, type="tool_result", node="investigate", tool="firecrawl.scrape",
+        success=result.success, credits_used=result.credits_used, artifact_ref=artifact,
+    )
+
+    if not result.success or not result.markdown or len(result.markdown.strip()) < 100:
+        return None
+
+    findings["pdf_extracted_chars"] = len(result.markdown)
+    evidence.source_type = SourceType.SSR_HTML
+    evidence.pagination_param_confirmed = True
+    evidence.pagination_mechanism = "single_page"
+    evidence.india_filter_mechanism = "client_side_fallback"
+    return (
+        "PDF SOURCE — the careers page is a PDF document, extracted to text via Firecrawl "
+        "during investigation only. The generated scraper must fetch this PDF URL directly "
+        "at runtime and parse it with `pypdf` (`PdfReader(BytesIO(resp.content))`, then "
+        "`.pages[i].extract_text()`) — never call Firecrawl from the generated script itself, "
+        "no browser, no regex. Extracted text sample:\n\n" + result.markdown[:6000]
+    )
 
 
 def _classify_candidates(fetch_result, careers_url: str, domain: str, run_id: str, findings: dict, evidence) -> Optional[str]:
@@ -619,17 +785,49 @@ def investigate(state: AgentState) -> AgentState:
     careers_url = evidence.careers_url
     domain = state["domain"]
     run_id = state.get("run_id", "run")
-
-    trace_sink.emit(domain, run_id, type="tool_call", node="investigate", tool="fetch_url", input={"url": careers_url})
-    fetch_result = fetch_url(careers_url)
-    html_artifact = trace_sink.save_artifact(domain, "page.html", fetch_result.html)
-    trace_sink.emit(
-        domain, run_id, type="tool_result", node="investigate", tool="fetch_url",
-        status=fetch_result.status, network_request_count=len(fetch_result.network_requests),
-        artifact_ref=html_artifact,
-    )
-
     findings: dict[str, Any] = {"careers_url": careers_url}
+
+    # Escalation: the careers URL is a PDF, not a web page — route to
+    # Firecrawl's native PDF parsing instead of failing outright. Checked
+    # before anything else since Playwright/lxml have nothing useful to do
+    # with a PDF response.
+    try:
+        head_probe = probe_endpoint(careers_url, method="HEAD", timeout=15.0)
+        content_type = (head_probe.content_type or "").lower()
+    except Exception:
+        content_type = ""
+
+    if "application/pdf" in content_type:
+        trace_sink.emit(
+            domain, run_id, type="decision", node="investigate", action="route_to_firecrawl_pdf",
+            rationale=f"{careers_url} resolves to a PDF (content-type={content_type}).",
+        )
+        sample_text = _classify_pdf_source(careers_url, domain, run_id, findings, evidence)
+        state["evidence_sample_path"] = _write_evidence_sample(domain, sample_text or "")
+        return _finish_investigation(state, evidence, findings, careers_url, domain, run_id)
+
+    # Escalation: the previous docker_execute run was blocked with
+    # HTTP_FORBIDDEN — retry the primary fetch through Firecrawl (which has
+    # its own proxy/stealth handling) before giving up on this domain.
+    prior_report = state.get("validation_report")
+    retry_after_forbidden = bool(prior_report and prior_report.failure_category == FailureCategory.HTTP_FORBIDDEN)
+
+    if retry_after_forbidden:
+        trace_sink.emit(
+            domain, run_id, type="decision", node="investigate", action="retry_via_firecrawl_after_403",
+            rationale="Previous scraper run was blocked with HTTP_FORBIDDEN — retrying via Firecrawl before giving up.",
+        )
+        fetch_result = _fetch_via_firecrawl(careers_url, domain, run_id)
+    else:
+        trace_sink.emit(domain, run_id, type="tool_call", node="investigate", tool="fetch_url", input={"url": careers_url})
+        fetch_result = fetch_url(careers_url)
+        html_artifact = trace_sink.save_artifact(domain, "page.html", fetch_result.html)
+        trace_sink.emit(
+            domain, run_id, type="tool_result", node="investigate", tool="fetch_url",
+            status=fetch_result.status, network_request_count=len(fetch_result.network_requests),
+            artifact_ref=html_artifact,
+        )
+
     sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence)
 
     # discover.py's ATS-link check uses a plain HTTP probe (no JS), so it
@@ -639,7 +837,15 @@ def investigate(state: AgentState) -> AgentState:
     # (marketing page -> a specific job posting -> that posting's "back to
     # all openings" link, which is often shorter/more general than the
     # first link found) before trying anything more expensive.
-    for _ in range(2):
+    #
+    # Only when careers_url is NOT already an ATS-hosted page: once we're
+    # on job-boards.greenhouse.io/{company}, that page's own footer/nav
+    # links (privacy policy, sign-in, regional marketing pages) ALSO live
+    # on greenhouse.io and would otherwise match the same marker — hopping
+    # to those derails a working job board into the ATS vendor's own
+    # corporate site instead of trusting the classification already done.
+    already_on_ats_host = any(marker in urlparse(careers_url).netloc for marker in ATS_DOMAIN_MARKERS)
+    for _ in range(2 if not already_on_ats_host else 0):
         if evidence.is_sufficient():
             break
         ats_link = _find_ats_link(fetch_result.html, careers_url)
@@ -701,6 +907,28 @@ def investigate(state: AgentState) -> AgentState:
         if retried_sample_text is not None:
             sample_text = retried_sample_text
 
+        firecrawl_this_pass = False
+        if sample_text is None and not state.get("firecrawl_actions_attempted"):
+            # Escalation: bounded Playwright interactions still found zero
+            # job DOM nodes — one Firecrawl Actions attempt with a richer,
+            # more deliberate interaction sequence before giving up. Capped
+            # to once per run (not once per retry) — evidence_check's
+            # insufficient-evidence loop re-invokes investigate() from
+            # scratch, and the page structure doesn't change between
+            # retries, so repeating this would just re-burn a real, paid
+            # Firecrawl credit for the same answer every time.
+            trace_sink.emit(
+                domain, run_id, type="decision", node="investigate", action="attempt_firecrawl_actions",
+                rationale="Playwright interactions found zero job DOM nodes — escalating to Firecrawl Actions.",
+            )
+            firecrawl_this_pass = True
+            state["firecrawl_actions_attempted"] = True
+            firecrawl_result = _try_firecrawl_actions(careers_url, domain, run_id)
+            fetch_result = firecrawl_result
+            firecrawl_sample_text = _classify_candidates(fetch_result, careers_url, domain, run_id, findings, evidence)
+            if firecrawl_sample_text is not None:
+                sample_text = firecrawl_sample_text
+
         if sample_text is None:
             evidence.source_type = SourceType.SPA_NO_API
             evidence.pagination_param_confirmed = False
@@ -709,12 +937,20 @@ def investigate(state: AgentState) -> AgentState:
                 domain, run_id, type="decision", node="investigate", action="classify_spa_no_api",
                 rationale=(
                     "No JSON API and no job-shaped links found even after "
-                    f"{len(interactive_result.interactions)} bounded browser interaction(s)."
+                    f"{len(interactive_result.interactions)} bounded browser interaction(s)"
+                    + (" and a Firecrawl Actions escalation." if firecrawl_this_pass else " (Firecrawl already exhausted on an earlier attempt this run).")
                 ),
             )
 
     state["evidence_sample_path"] = _write_evidence_sample(domain, sample_text or "")
+    return _finish_investigation(state, evidence, findings, careers_url, domain, run_id)
 
+
+def _finish_investigation(state: AgentState, evidence, findings: dict, careers_url: str, domain: str, run_id: str) -> AgentState:
+    """Shared tail: LLM interpretation of gathered findings + final evidence
+    trace event. Called both from the PDF early-return path and the normal
+    empirical-investigation path.
+    """
     host = urlparse(careers_url).netloc
     findings["ats_hint"] = next((v for k, v in ATS_HOST_HINTS.items() if k in host), None)
 

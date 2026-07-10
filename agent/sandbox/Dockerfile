@@ -10,7 +10,8 @@ RUN pip install --no-cache-dir \
     jmespath \
     python-dateutil \
     pydantic \
-    pycountry
+    pycountry \
+    pypdf
 
 WORKDIR /app
 COPY entrypoint.sh /entrypoint.sh

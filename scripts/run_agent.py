@@ -4,15 +4,26 @@
 """
 
 import argparse
+import sys
 import time
+
+# Windows' console defaults to cp1252, which can't render job-description
+# text (curly quotes, non-English names, etc.) — reconfigure before
+# anything prints, so the CLI works without the caller having to set
+# PYTHONIOENCODING=utf-8 manually every run.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from agent.graph import build_graph
 from agent.models.evidence import InvestigationEvidence
 from agent.state import AgentState
+from agent.trace.sink import trace_sink
 from config import settings
 
 
 def run(domain: str) -> AgentState:
+    trace_sink.console = True  # live progress in the terminal, not just the trace file
     graph = build_graph()
     initial_state: AgentState = {
         "domain": domain,
@@ -31,6 +42,7 @@ def run(domain: str) -> AgentState:
         "evidence_sample_path": None,
         "script_revision": 0,
         "run_id": str(int(time.time())),
+        "firecrawl_actions_attempted": False,
     }
     final_state = graph.invoke(initial_state, {"recursion_limit": 200})
     return final_state
