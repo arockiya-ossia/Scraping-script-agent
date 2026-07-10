@@ -1,6 +1,6 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def _now() -> float:
@@ -10,11 +10,25 @@ def _now() -> float:
 
 
 class TraceEvent(BaseModel):
+    """The persistent trace deliverable's per-line schema (CLAUDE.md §9).
+
+    `extra="allow"` is deliberate: the different event `type`s (tool_call,
+    tool_result, decision, evidence, code_generated, execution, validation,
+    repair_decision, ...) carry genuinely different payload shapes. Forcing
+    one giant flat schema with dozens of Optional fields would be worse than
+    letting each call site attach exactly the fields relevant to its event
+    type, while still requiring the fields every event needs regardless of
+    type (timestamp, domain, type).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     timestamp: float = Field(default_factory=_now)
     domain: str
-    node: str
-    event_type: str  # "node_enter", "tool_call", "llm_call", "node_exit", "repair_decision"
-    summary: str  # short human-readable line, kept in LangGraph state
-    artifact_ref: Optional[str] = None  # path into artifacts/ for full payloads
+    type: str  # "node_enter", "tool_call", "tool_result", "decision", "evidence",
+    # "code_generated", "execution", "validation", "repair_decision", "node_exit", ...
+    node: Optional[str] = None
+    summary: Optional[str] = None
+    artifact_ref: Optional[str] = None
     tokens_prompt: Optional[int] = None
     tokens_completion: Optional[int] = None

@@ -1,28 +1,33 @@
 # Investigate
 
-You are investigating the careers page at `{careers_url}` for domain `{domain}`.
+You are interpreting empirical findings already gathered for the careers
+page at `{careers_url}` for domain `{domain}`.
 
-You have access to `fetch_url` (Playwright, with network capture) and
-`probe_endpoint` (direct httpx). Use them to empirically determine:
+Deterministic Python code has already:
+- Fetched the page with a real browser and captured its XHR/fetch network
+  traffic, looking for a JSON job-listing API.
+- If a JSON API was found: empirically tested pagination by requesting a
+  second page/offset and diffing the result set, and tested for a
+  server-side India filter by adding common query params and checking
+  whether the result set changed.
+- If no JSON API was found: extracted job-shaped links from the raw HTML
+  and ran the same pagination/filter probes against HTML query params.
 
-1. **Source type** — is job data server-rendered HTML, embedded JSON in the
-   page (e.g. a `<script type="application/json">` blob), a REST API, a
-   GraphQL API, or a JS-only SPA with no discoverable API?
-2. **Pagination mechanism** — offset/limit, cursor, page number, or infinite
-   scroll. You must confirm this by actually calling `probe_endpoint` with a
-   different page/offset value and observing that the result set changes —
-   never guess from the UI alone.
-3. **India filter mechanism** — is there a query param (e.g. `country=IN`,
-   `location=India`) that filters server-side? If not, note
-   `client_side_fallback` so the generated script pulls all jobs and filters
-   client-side.
-4. **Reported total count** — if the source itself exposes a total job count,
-   record it; it's used later for pagination-undercount sanity checks.
+You have **no tools and cannot make further requests** — your only job is
+to read the findings below and decide:
 
-Known ATS platforms (Greenhouse, Workday, Lever, SmartRecruiters, etc.) have
-recognizable response shapes — treat a match as a **hint only**. Every fact
-must still be confirmed empirically via `probe_endpoint`/`fetch_url` before
-being trusted (CLAUDE.md Constraint #2).
+1. **`source_type`** — the classification (`ssr_html`, `embedded_json`,
+   `rest_api`, `graphql`, `spa_no_api`, or `unknown`) that best fits what
+   was actually observed. Known ATS platforms (Greenhouse, Workday, Lever,
+   SmartRecruiters, etc.) have recognizable response shapes — a hint in
+   the findings is exactly that, a hint, not a substitute for what the
+   probes actually returned.
+2. **`reported_total_count`** — if the findings mention a count the source
+   itself reports (e.g. a facet count, a `total` field), extract it as an
+   integer; otherwise `null`.
+3. **`evidence_notes`** — a short paragraph explaining your classification,
+   which goes straight into the run's trace.
 
-Return an `InvestigationEvidence` object. Put your reasoning in
-`evidence_notes` — it goes straight into the trace.
+Do not invent a pagination mechanism or India-filter mechanism yourself —
+those were either confirmed by the probes above or they weren't; that part
+of the evidence is not yours to fill in.

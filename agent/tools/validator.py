@@ -2,6 +2,7 @@
 output (CLAUDE.md §11). Cheapest checks first so a bad script fails fast.
 """
 
+import ast
 import json
 
 import httpx
@@ -10,12 +11,74 @@ from pydantic import ValidationError
 from agent.models.job_record import JobRecord
 from agent.models.validation import FailureCategory, ValidationReport
 
-REGEX_MARKERS = ("import re", "re.compile", "re.match", "re.search", "re.findall", "re.sub")
-
 
 def check_no_regex(source: str) -> bool:
-    """Returns True if the source is clean (no regex usage found)."""
-    return not any(marker in source for marker in REGEX_MARKERS)
+    """Returns True if the source is clean (no `re` module usage found).
+
+    AST-based, not substring-based — a naive substring check on "import re"
+    false-positives on "import requests" (it's a literal substring: "import
+    re" + "quests"), which would reject every scraper using the one HTTP
+    library the sandbox actually ships.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True  # syntax errors are validate.py's job, not this check's
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name == "re" for alias in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "re":
+                return False
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "re":
+                return False
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "__import__"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "re"
+            ):
+                return False
+    return True
+
+
+# Byte sequences that appear when UTF-8 text (curly quotes, dashes,
+# accented letters) gets decoded as Latin-1/cp1252 somewhere in the
+# scraper's HTTP/parsing pipeline — e.g. `requests` not being told the
+# response is UTF-8, or manually decoding bytes with the wrong codec.
+# Written as \uXXXX escapes, not literal characters, so the marker values
+# can't be silently corrupted by a terminal/file encoding round-trip —
+# exactly the class of bug this check exists to catch in generated code.
+MOJIBAKE_MARKERS = (
+    "â€™",  # UTF-8 for U+2019 (') misread as cp1252
+    "â€œ",  # UTF-8 for U+201C (") misread as cp1252
+    "â€“",  # UTF-8 for U+2013 (en dash) misread as cp1252
+    "â€”",  # UTF-8 for U+2014 (em dash) misread as cp1252
+    "Ã©",  # UTF-8 for U+00E9 (e-acute) misread as cp1252
+    "Ã¨",  # UTF-8 for U+00E8 (e-grave) misread as cp1252
+    "Ã±",  # UTF-8 for U+00F1 (n-tilde) misread as cp1252
+    "Â ",  # UTF-8 for U+00A0 (non-breaking space) misread as cp1252
+    "�",  # replacement character — an outright decode failure
+)
+
+
+def check_no_mojibake(records: list[JobRecord]) -> bool:
+    """Returns True if none of the text fields show UTF-8-decoded-as-Latin-1
+    mojibake artifacts. Deterministic substring scan — genuinely reliable
+    here because these byte sequences essentially never occur in correctly
+    decoded English/most-language text, unlike the `import re` false
+    positive risk that AST-based check_no_regex had to guard against.
+    """
+    for record in records:
+        for value in record.model_dump().values():
+            if isinstance(value, str) and any(marker in value for marker in MOJIBAKE_MARKERS):
+                return False
+    return True
 
 
 def validate_output(
@@ -94,6 +157,16 @@ def validate_output(
             all_country_code_is_IN=False,
             failure_category=FailureCategory.ZERO_RESULTS_FILTER_MISMATCH,
             details=f"Found non-IN country codes: {country_codes - {'IN'}}",
+        )
+
+    if not check_no_mojibake(records):
+        return ValidationReport(
+            passed=False,
+            row_count=row_count,
+            non_null_field_rates=non_null_rates,
+            all_country_code_is_IN=all_india,
+            failure_category=FailureCategory.MOJIBAKE_ENCODING,
+            details="Text fields contain UTF-8-decoded-as-Latin-1 artifacts (e.g. ’/“ misread as cp1252) — the scraper likely isn't decoding HTTP responses as UTF-8.",
         )
 
     spot_check_ok: bool | None = None

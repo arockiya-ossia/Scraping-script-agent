@@ -12,13 +12,9 @@ def traced(node_fn):
     @wraps(node_fn)
     def wrapper(state: AgentState) -> AgentState:
         run_id = state.get("run_id", "run")
-        trace_sink.emit(
-            state["domain"], run_id, node=node_fn.__name__, event_type="node_enter", summary="entered"
-        )
+        trace_sink.emit(state["domain"], run_id, type="node_enter", node=node_fn.__name__)
         new_state = node_fn(state)
-        trace_sink.emit(
-            state["domain"], run_id, node=node_fn.__name__, event_type="node_exit", summary="exited"
-        )
+        trace_sink.emit(new_state["domain"], run_id, type="node_exit", node=node_fn.__name__)
         return new_state
 
     return wrapper

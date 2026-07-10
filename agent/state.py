@@ -22,3 +22,17 @@ class AgentState(TypedDict):
     last_stderr: Optional[str]
     last_exit_code: Optional[int]
     last_timed_out: bool
+
+    # Set by investigate, consumed by generate_script — a path into
+    # artifacts/ (per §6.5's own "referenced by path/hash, never inlined
+    # into state" rule), pointing at a concrete HTML/JSON sample of the real
+    # page so codegen writes selectors against actual markup instead of
+    # guessing from training data.
+    evidence_sample_path: Optional[str]
+
+    # Incremented on every generate_script (fresh or rewrite) and every
+    # repair_strategy patch — feeds the trace's "code_generated" events'
+    # revision number, and each revision's source is archived to artifacts/.
+    script_revision: int
+
+    run_id: str  # trace file discriminator: traces/{domain}_{run_id}.jsonl

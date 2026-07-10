@@ -12,6 +12,7 @@ from agent.nodes import traced
 from agent.state import AgentState
 from agent.tools.probe_endpoint import ProbeResult, probe_endpoint
 from agent.tools.search_web import search_web
+from agent.trace.sink import trace_sink
 
 COMMON_PATHS = [
     "/careers",
@@ -72,28 +73,51 @@ def _find_ats_link(html_text: str, base_url: str) -> Optional[str]:
 def discover(state: AgentState) -> AgentState:
     domain = state["domain"]
     evidence = state["evidence"]
+    run_id = state.get("run_id", "run")
 
+    query = f"{domain} careers jobs"
+    trace_sink.emit(domain, run_id, type="tool_call", node="discover", tool="search_web", input={"query": query})
     candidates: list[str] = []
     try:
-        results = search_web(f"{domain} careers jobs")
+        results = search_web(query)
         candidates.extend(
             r["link"] for r in results if r.get("link") and _looks_like_careers_url(r["link"], domain)
         )
-    except Exception:
-        pass  # search failure isn't fatal — fall back to common-path probing
+        trace_sink.emit(
+            domain, run_id, type="tool_result", node="discover", tool="search_web",
+            matched_candidates=candidates[:10],
+        )
+    except Exception as exc:
+        trace_sink.emit(domain, run_id, type="tool_result", node="discover", tool="search_web", error=str(exc))
+        # search failure isn't fatal — fall back to common-path probing
 
     candidates.extend(f"https://{domain}{path}" for path in COMMON_PATHS)
 
     chosen = None
+    ats_link_found = None
     for url in candidates:
+        trace_sink.emit(domain, run_id, type="tool_call", node="discover", tool="probe_endpoint", input={"url": url})
         result = _probe(url)
         if result is None:
+            trace_sink.emit(domain, run_id, type="tool_result", node="discover", tool="probe_endpoint", status=None)
             continue
+        trace_sink.emit(domain, run_id, type="tool_result", node="discover", tool="probe_endpoint", status=result.status)
         chosen = url
         ats_link = _find_ats_link(result.text_body, url)
         if ats_link:
             chosen = ats_link
+            ats_link_found = ats_link
         break
 
     evidence.careers_url = chosen or (candidates[0] if candidates else f"https://{domain}")
+    trace_sink.emit(
+        domain, run_id, type="decision", node="discover",
+        action="follow_ats_link" if ats_link_found else "use_probed_candidate",
+        rationale=(
+            f"Careers page linked out to a recognized ATS domain ({ats_link_found})."
+            if ats_link_found
+            else f"First candidate that responded successfully: {evidence.careers_url}."
+        ),
+        chosen_url=evidence.careers_url,
+    )
     return state

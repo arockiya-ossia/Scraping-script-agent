@@ -4,6 +4,7 @@
 """
 
 import argparse
+import time
 
 from agent.graph import build_graph
 from agent.models.evidence import InvestigationEvidence
@@ -27,6 +28,9 @@ def run(domain: str) -> AgentState:
         "last_stderr": None,
         "last_exit_code": None,
         "last_timed_out": False,
+        "evidence_sample_path": None,
+        "script_revision": 0,
+        "run_id": str(int(time.time())),
     }
     final_state = graph.invoke(initial_state, {"recursion_limit": 200})
     return final_state

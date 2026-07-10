@@ -26,6 +26,8 @@ def build_image() -> None:
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
@@ -69,6 +71,8 @@ def run_script(script_path: Path, output_dir: Path, domain: str) -> SandboxRunRe
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=settings.sandbox_timeout_seconds,
         )
         return SandboxRunResult(

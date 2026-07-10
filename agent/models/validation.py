@@ -14,6 +14,7 @@ class FailureCategory(str, Enum):
     ZERO_RESULTS_FILTER_MISMATCH = "zero_results_filter_mismatch"  # wrong param sent to the source
     ZERO_RESULTS_PARSING_BUG = "zero_results_parsing_bug"  # data came back fine, our parsing logic is wrong
     CONTAINS_REGEX = "contains_regex"  # static check caught `import re` / regex usage
+    MOJIBAKE_ENCODING = "mojibake_encoding"  # UTF-8 bytes decoded as Latin-1/cp1252 (Ã©, â€™, etc.)
     OTHER = "other"
 
 

@@ -7,6 +7,19 @@ evidence below:
 {evidence_json}
 ```
 
+## Real sample from the actual page/API (write selectors/paths against THIS)
+
+```
+{evidence_sample}
+```
+
+Write every CSS selector, JSON path, and dict key access against the exact
+shape shown above — not against what this platform "usually" looks like.
+If a field you need isn't visible in the sample, still write reasonable
+extraction code for it (it may appear on other job postings), but never
+invent a selector you can't tie back to something in the sample or the
+evidence above.
+
 ## Hard requirements
 
 - Output must be a single, self-contained Python file runnable as
@@ -26,12 +39,20 @@ evidence below:
   inferred from free-text job descriptions.
 - Any field not structurally present must be emitted as `null` — never guess
   or hallucinate.
+- Decode HTTP responses as UTF-8 explicitly. With `requests`, set
+  `resp.encoding = resp.apparent_encoding` (or `"utf-8"`) before reading
+  `resp.text` — don't rely on the guessed default, or curly quotes/accented
+  letters in job titles and descriptions come out mojibake (’ instead of ').
+  With `httpx`, prefer decoding `resp.content` as UTF-8 explicitly.
 - Implement the **full** pagination loop confirmed during investigation, not
   just the first page.
-- Emit one JSON object per line (JSONL), each shaped like `JobRecord`:
+- Emit one JSON object per line (JSONL). Each line is a **flat object with
+  exactly these top-level keys** — no wrapper object, no nesting under
+  "properties" or anything else, just this shape with real values filled in
+  (or `null` where genuinely missing):
 
-```
-{job_record_schema}
+```json
+{job_record_example}
 ```
 
 Return only the Python source, no prose.
